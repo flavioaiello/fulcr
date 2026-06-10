@@ -14,7 +14,10 @@ const BUILDER_DIGEST: &str =
 async fn contains_visible_npm_worm_install_script_from_lockfile() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
-        fs::canonicalize(temp.path()).unwrap().as_path().join("package.json"),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("package.json"),
         r#"{
   "name": "victim-app",
   "version": "1.0.0",
@@ -25,7 +28,10 @@ async fn contains_visible_npm_worm_install_script_from_lockfile() {
     )
     .unwrap();
     fs::write(
-        fs::canonicalize(temp.path()).unwrap().as_path().join("package-lock.json"),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("package-lock.json"),
         r#"{
   "name": "victim-app",
   "lockfileVersion": 3,
@@ -50,9 +56,13 @@ async fn contains_visible_npm_worm_install_script_from_lockfile() {
     .unwrap();
 
     let recipe = tight_recipe(fs::canonicalize(temp.path()).unwrap().as_path());
-    let report = scanner::scan_recipe(&recipe, ScanRequest::default(), fs::canonicalize(temp.path()).unwrap().as_path())
-        .await
-        .unwrap();
+    let report = scanner::scan_recipe(
+        &recipe,
+        ScanRequest::default(),
+        fs::canonicalize(temp.path()).unwrap().as_path(),
+    )
+    .await
+    .unwrap();
     let categories = finding_categories(&report);
 
     assert!(categories.contains("sbom-lifecycle-script"));
@@ -73,7 +83,10 @@ async fn contains_visible_npm_worm_install_script_from_lockfile() {
 async fn contains_token_harvesting_and_self_publish_script_metadata() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
-        fs::canonicalize(temp.path()).unwrap().as_path().join("package.json"),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("package.json"),
         r#"{
   "name": "tainted-release-package",
   "version": "1.0.0",
@@ -88,15 +101,22 @@ async fn contains_token_harvesting_and_self_publish_script_metadata() {
     )
     .unwrap();
     fs::write(
-        fs::canonicalize(temp.path()).unwrap().as_path().join("postinstall.js"),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("postinstall.js"),
         "console.log(process.env.NPM_TOKEN || process.env.GITHUB_TOKEN);\n",
     )
     .unwrap();
 
     let recipe = tight_recipe(fs::canonicalize(temp.path()).unwrap().as_path());
-    let report = scanner::scan_recipe(&recipe, ScanRequest::default(), fs::canonicalize(temp.path()).unwrap().as_path())
-        .await
-        .unwrap();
+    let report = scanner::scan_recipe(
+        &recipe,
+        ScanRequest::default(),
+        fs::canonicalize(temp.path()).unwrap().as_path(),
+    )
+    .await
+    .unwrap();
     let categories = finding_categories(&report);
 
     assert!(categories.contains("sbom-lifecycle-script"));
@@ -114,7 +134,10 @@ async fn contains_token_harvesting_and_self_publish_script_metadata() {
 async fn blocks_historical_replay_when_provenance_is_weak() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
-        fs::canonicalize(temp.path()).unwrap().as_path().join("package.json"),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("package.json"),
         "{\"name\":\"victim-app\"}\n",
     )
     .unwrap();
@@ -124,7 +147,12 @@ async fn blocks_historical_replay_when_provenance_is_weak() {
         source: SourceRef {
             repo: "https://example.invalid/victim-app.git".to_string(),
             revision: "main".to_string(),
-            path: Some(fs::canonicalize(temp.path()).unwrap().as_path().to_path_buf()),
+            path: Some(
+                fs::canonicalize(temp.path())
+                    .unwrap()
+                    .as_path()
+                    .to_path_buf(),
+            ),
         },
         builder: BuilderRef {
             kind: BuilderKind::Script,
@@ -139,9 +167,13 @@ async fn blocks_historical_replay_when_provenance_is_weak() {
     })
     .unwrap();
 
-    let report = scanner::scan_recipe(&recipe, ScanRequest::default(), fs::canonicalize(temp.path()).unwrap().as_path())
-        .await
-        .unwrap();
+    let report = scanner::scan_recipe(
+        &recipe,
+        ScanRequest::default(),
+        fs::canonicalize(temp.path()).unwrap().as_path(),
+    )
+    .await
+    .unwrap();
     let decision = gate::evaluate_gate(&recipe, None, Some(&report), &[]);
 
     assert_eq!(decision.outcome, GateOutcome::Denied);

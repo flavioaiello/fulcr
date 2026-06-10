@@ -17,7 +17,10 @@ pub fn evaluate_gate(
     if let Some(build) = latest_build {
         if !build.security_anomalies.is_empty() {
             for anomaly in &build.security_anomalies {
-                reasons.push(format!("Build security anomaly detected (C2/Malware activity): {}", anomaly));
+                reasons.push(format!(
+                    "Build security anomaly detected (C2/Malware activity): {}",
+                    anomaly
+                ));
             }
         }
     }

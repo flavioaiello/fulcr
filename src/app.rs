@@ -25,9 +25,9 @@ use crate::{
         slsa_provenance_document,
     },
     models::{
-        timestamp, timestamp_after_seconds, ArtifactRef, BuildRecord, BuildRequest, BuildStatus,
-        GateDecision, GateOutcome, Recipe, RecipeInput, ScanReport, ScanRequest, VexInput,
-        VexStatement,
+        oci_image_config_bytes, oci_image_config_bytes_for_layers, timestamp,
+        timestamp_after_seconds, ArtifactRef, BuildRecord, BuildRequest, BuildStatus, GateDecision,
+        GateOutcome, Recipe, RecipeInput, ScanReport, ScanRequest, VexInput, VexStatement,
     },
     scanner,
     store::Store,
@@ -41,14 +41,20 @@ pub struct AppState {
 }
 
 pub fn router(store: Store, work_dir: PathBuf) -> Router {
-    router_with_auth(store, work_dir, std::env::var("fulcr_TOKEN").ok())
+    router_with_auth(
+        store,
+        work_dir,
+        std::env::var("fulcr_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty()),
+    )
 }
 
 pub fn router_with_auth(store: Store, work_dir: PathBuf, auth_token: Option<String>) -> Router {
+    let auth_token = auth_token.filter(|token| !token.trim().is_empty());
     if auth_token.is_none() {
         tracing::warn!(
-            "fulcr_TOKEN is not set; mutating endpoints are unauthenticated. \
-             Bind to 127.0.0.1 only or set fulcr_TOKEN before exposing this listener."
+            "fulcr_TOKEN is not set; mutating endpoints will reject requests until a bearer token is configured."
         );
     }
     let state = AppState {
@@ -69,28 +75,8 @@ pub fn router_with_auth(store: Store, work_dir: PathBuf, auth_token: Option<Stri
         .route("/healthz", get(healthz))
         .route("/v2/", get(oci_health).head(oci_health))
         .route(
-            "/v2/:name/manifests/:reference",
-            get(oci_manifest).head(oci_manifest_head),
-        )
-        .route(
-            "/v2/:namespace/:name/manifests/:reference",
-            get(oci_manifest).head(oci_manifest_head),
-        )
-        .route(
-            "/v2/:name/blobs/:digest",
-            get(oci_blob).head(oci_blob_head),
-        )
-        .route(
-            "/v2/:namespace/:name/blobs/:digest",
-            get(oci_blob).head(oci_blob_head),
-        )
-        .route(
-            "/v2/:name/referrers/:digest",
-            get(oci_referrers_stub),
-        )
-        .route(
-            "/v2/:namespace/:name/referrers/:digest",
-            get(oci_referrers_stub),
+            "/v2/*path",
+            get(oci_distribution).head(oci_distribution_head),
         )
         .route("/v1/recipes", get(list_recipes).post(create_recipe))
         .route("/v1/recipes/:id", get(get_recipe))
@@ -113,24 +99,27 @@ pub fn router_with_auth(store: Store, work_dir: PathBuf, auth_token: Option<Stri
         .with_state(state)
 }
 
-async fn require_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let method = request.method();
     let path = request.uri().path();
 
-    // Read-only and health endpoints remain open; mutating endpoints require the token when set.
-    let needs_auth = matches!(method, &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE)
-        || path.starts_with("/v1/recipes") && path.ends_with("/vex") && method == Method::POST;
+    // Read-only and health endpoints remain open; mutating endpoints require a configured token.
+    let needs_auth =
+        matches!(
+            method,
+            &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+        ) || path.starts_with("/v1/recipes") && path.ends_with("/vex") && method == Method::POST;
 
     if !needs_auth {
         return next.run(request).await;
     }
 
     let Some(expected) = state.auth_token.as_ref() else {
-        return next.run(request).await;
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "fulcr_TOKEN is required for mutating endpoints" })),
+        )
+            .into_response();
     };
 
     let presented = request
@@ -195,6 +184,91 @@ async fn oci_referrers_stub() -> Response {
     (headers, Json(index)).into_response()
 }
 
+async fn oci_distribution(
+    Path(path): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    oci_distribution_response(path, state, true).await
+}
+
+async fn oci_distribution_head(
+    Path(path): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    oci_distribution_response(path, state, false).await
+}
+
+async fn oci_distribution_response(
+    path: String,
+    state: AppState,
+    include_body: bool,
+) -> AppResult<Response> {
+    match parse_oci_route(&path)? {
+        OciRoute::Manifest { name, reference } => {
+            oci_manifest_response(name, reference, state, include_body).await
+        }
+        OciRoute::Blob { digest } => oci_blob_response(digest, state, include_body).await,
+        OciRoute::Referrers => Ok(oci_referrers_stub().await),
+    }
+}
+
+enum OciRoute {
+    Manifest { name: String, reference: String },
+    Blob { digest: String },
+    Referrers,
+}
+
+fn parse_oci_route(path: &str) -> AppResult<OciRoute> {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return Err(AppError::not_found(format!("OCI route {path} not found")));
+    }
+
+    let name = parts[..parts.len() - 2].join("/");
+    let selector = parts[parts.len() - 2];
+    let value = parts[parts.len() - 1].to_string();
+    if name.is_empty() || value.is_empty() {
+        return Err(AppError::not_found(format!("OCI route {path} not found")));
+    }
+
+    match selector {
+        "manifests" => Ok(OciRoute::Manifest {
+            name,
+            reference: value,
+        }),
+        "blobs" => Ok(OciRoute::Blob { digest: value }),
+        "referrers" => Ok(OciRoute::Referrers),
+        _ => Err(AppError::not_found(format!("OCI route {path} not found"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multi_segment_oci_manifest_route() {
+        match parse_oci_route("team/platform/service/manifests/v1").unwrap() {
+            OciRoute::Manifest { name, reference } => {
+                assert_eq!(name, "team/platform/service");
+                assert_eq!(reference, "v1");
+            }
+            _ => panic!("expected manifest route"),
+        }
+    }
+
+    #[test]
+    fn parses_multi_segment_oci_blob_route() {
+        match parse_oci_route("team/platform/service/blobs/sha256:abc").unwrap() {
+            OciRoute::Blob { digest } => assert_eq!(digest, "sha256:abc"),
+            _ => panic!("expected blob route"),
+        }
+    }
+}
+
 async fn list_recipes(State(state): State<AppState>) -> AppResult<Json<Vec<Recipe>>> {
     Ok(Json(state.store.list_recipes().await?))
 }
@@ -208,6 +282,11 @@ async fn create_recipe(
     }
     if input.source.revision.trim().is_empty() {
         return Err(AppError::bad_request("source revision must not be empty"));
+    }
+    if input.build.run_command.is_some() {
+        return Err(AppError::bad_request(
+            "build.run_command requires an enforced native sandbox and is not supported yet",
+        ));
     }
 
     let recipe = Recipe::new(input)?;
@@ -389,65 +468,70 @@ async fn get_slsa(
     )?))
 }
 
-async fn oci_manifest(
-    Path(params): Path<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> AppResult<Response> {
-    oci_manifest_response(params, state, true).await
-}
-
-async fn oci_manifest_head(
-    Path(params): Path<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> AppResult<Response> {
-    oci_manifest_response(params, state, false).await
-}
-
 async fn oci_manifest_response(
-    params: std::collections::HashMap<String, String>,
+    name: String,
+    reference: String,
     state: AppState,
     include_body: bool,
 ) -> AppResult<Response> {
-    let name = params.get("name").cloned().unwrap_or_default();
-    let namespace = params.get("namespace").cloned();
-    let full_name = if let Some(ns) = namespace {
-        format!("{ns}/{name}")
-    } else {
-        name.clone()
-    };
-    let reference = params.get("reference").cloned().unwrap_or_default();
-
     let recipe = if let Ok(id) = Uuid::parse_str(&reference) {
-        state.store.get_recipe(id).await?.filter(|r| r.name == name || r.name == full_name)
+        state.store.get_recipe(id).await?.filter(|r| r.name == name)
     } else {
-        if let Some(r) = state.store.lookup_recipe(&name, &reference).await? {
-            Some(r)
-        } else {
-            state.store.lookup_recipe(&full_name, &reference).await?
-        }
+        state.store.lookup_recipe(&name, &reference).await?
     };
 
-    let recipe = recipe.ok_or_else(|| AppError::not_found(format!("manifest {full_name}:{reference} not found")))?;
+    let recipe = recipe
+        .ok_or_else(|| AppError::not_found(format!("manifest {name}:{reference} not found")))?;
 
     enforce_manifest_gate(&state, &recipe).await?;
 
-    let config = serde_json::to_vec(&recipe)?;
+    let layer = latest_materialized_layer(&state, &recipe).await?;
+    let diff_ids = vec![layer.digest.clone()];
+    let config = oci_image_config_bytes_for_layers(&recipe, &diff_ids)?;
     let config_digest = crate::digest::digest_bytes(&config);
-    
-    use oci_spec::image::{ImageManifestBuilder, MediaType, DescriptorBuilder};
+
+    use oci_spec::image::{DescriptorBuilder, ImageManifestBuilder, MediaType};
 
     let annotations = std::collections::HashMap::from([
-        ("org.opencontainers.image.source".to_string(), recipe.source.repo.clone()),
-        ("org.opencontainers.image.revision".to_string(), recipe.source.revision.clone()),
+        (
+            "org.opencontainers.image.source".to_string(),
+            recipe.source.repo.clone(),
+        ),
+        (
+            "org.opencontainers.image.revision".to_string(),
+            recipe.source.revision.clone(),
+        ),
         ("dev.fulcr.materialized".to_string(), "false".to_string()),
-        ("dev.fulcr.retention".to_string(), if recipe.policy.retain_artifact { "selective".to_string() } else { "ephemeral".to_string() }),
-        ("dev.fulcr.note".to_string(), "metadata-only manifest; artifact is constructed ad hoc".to_string()),
+        (
+            "dev.fulcr.retention".to_string(),
+            if recipe.policy.retain_artifact {
+                "selective".to_string()
+            } else {
+                "ephemeral".to_string()
+            },
+        ),
+        (
+            "dev.fulcr.note".to_string(),
+            "metadata-only manifest; artifact is constructed ad hoc".to_string(),
+        ),
     ]);
 
     let config_desc = DescriptorBuilder::default()
-        .media_type(MediaType::Other("application/vnd.fulcr.recipe.config.v1+json".to_string()))
-        .digest(config_digest.clone().parse::<oci_spec::image::Digest>().unwrap())
+        .media_type(MediaType::ImageConfig)
+        .digest(
+            config_digest
+                .clone()
+                .parse::<oci_spec::image::Digest>()
+                .unwrap(),
+        )
         .size(config.len() as u64)
+        .build()
+        .unwrap();
+
+    let layer_desc = DescriptorBuilder::default()
+        .media_type(MediaType::ImageLayer)
+        .digest(layer.digest.parse::<oci_spec::image::Digest>().unwrap())
+        .size(layer.size)
         .build()
         .unwrap();
 
@@ -455,7 +539,7 @@ async fn oci_manifest_response(
         .schema_version(2u32)
         .media_type(MediaType::ImageManifest)
         .config(config_desc)
-        .layers(vec![])
+        .layers(vec![layer_desc])
         .annotations(annotations)
         .build()
         .unwrap();
@@ -484,36 +568,20 @@ async fn oci_manifest_response(
     }
 }
 
-async fn oci_blob(
-    Path(params): Path<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> AppResult<Response> {
-    oci_blob_response(params, state, true).await
-}
-
-async fn oci_blob_head(
-    Path(params): Path<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> AppResult<Response> {
-    oci_blob_response(params, state, false).await
-}
-
 async fn oci_blob_response(
-    params: std::collections::HashMap<String, String>,
+    digest: String,
     state: AppState,
     include_body: bool,
 ) -> AppResult<Response> {
-    let digest = params.get("digest").cloned().unwrap_or_default();
-
     if let Some(recipe_id) = state.store.lookup_blob_recipe(&digest).await {
         if let Some(recipe) = state.store.get_recipe(recipe_id).await? {
-            let config = serde_json::to_vec(&recipe)?;
+            let config = oci_image_config_bytes(&recipe)?;
             // Re-verify the digest to defend against index drift.
             if crate::digest::digest_bytes(&config) == digest {
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/vnd.fulcr.recipe.config.v1+json"),
+                    HeaderValue::from_static("application/vnd.oci.image.config.v1+json"),
                 );
                 headers.insert(header::CONTENT_LENGTH, HeaderValue::from(config.len()));
                 headers.insert(
@@ -529,7 +597,34 @@ async fn oci_blob_response(
         }
     }
 
-    let cache_path = state.store.cache_dir().join(crate::digest::cache_file_name(&digest));
+    for recipe in state.store.list_recipes().await? {
+        if let Ok(layer) = latest_materialized_layer(&state, &recipe).await {
+            let diff_ids = vec![layer.digest.clone()];
+            let config = oci_image_config_bytes_for_layers(&recipe, &diff_ids)?;
+            if crate::digest::digest_bytes(&config) == digest {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/vnd.oci.image.config.v1+json"),
+                );
+                headers.insert(header::CONTENT_LENGTH, HeaderValue::from(config.len()));
+                headers.insert(
+                    "Docker-Content-Digest",
+                    HeaderValue::from_str(&digest).unwrap(),
+                );
+                return if include_body {
+                    Ok((headers, config).into_response())
+                } else {
+                    Ok((StatusCode::OK, headers).into_response())
+                };
+            }
+        }
+    }
+
+    let cache_path = state
+        .store
+        .cache_dir()
+        .join(crate::digest::cache_file_name(&digest));
     if let Ok(bytes) = fs::read(&cache_path).await {
         if crate::digest::digest_bytes(&bytes) != digest {
             // Defense in depth: refuse to serve a cached blob whose digest no longer matches.
@@ -553,6 +648,51 @@ async fn oci_blob_response(
     }
 
     Err(AppError::not_found(format!("blob {digest} not found")))
+}
+
+async fn latest_materialized_layer(state: &AppState, recipe: &Recipe) -> AppResult<ArtifactRef> {
+    let Some(build) = state.store.list_builds(recipe.id).await?.pop() else {
+        return Err(AppError::forbidden(
+            "metadata gate allowed pull, but no successful retained build artifact is available",
+        ));
+    };
+    if !matches!(build.status, BuildStatus::Succeeded) {
+        return Err(AppError::forbidden(format!(
+            "metadata gate allowed pull, but latest build {} is not successful",
+            build.id
+        )));
+    }
+    let Some(artifact) = build.artifact else {
+        return Err(AppError::forbidden(format!(
+            "metadata gate allowed pull, but latest build {} has no materialized artifact",
+            build.id
+        )));
+    };
+    if !artifact.retained {
+        return Err(AppError::forbidden(format!(
+            "metadata gate allowed pull, but latest build {} discarded its artifact",
+            build.id
+        )));
+    }
+    let Some(path) = artifact.path.as_ref() else {
+        return Err(AppError::forbidden(format!(
+            "metadata gate allowed pull, but latest build {} artifact has no cache path",
+            build.id
+        )));
+    };
+    let bytes = fs::read(path).await.map_err(|_| {
+        AppError::forbidden(format!(
+            "metadata gate allowed pull, but cached artifact for build {} is unavailable",
+            build.id
+        ))
+    })?;
+    if digest_bytes(&bytes) != artifact.digest {
+        return Err(AppError::forbidden(format!(
+            "metadata gate allowed pull, but cached artifact for build {} no longer matches its digest",
+            build.id
+        )));
+    }
+    Ok(artifact)
 }
 
 async fn load_recipe(state: &AppState, id: Uuid) -> AppResult<Recipe> {
@@ -601,18 +741,19 @@ async fn execute_native(
     cmd: Vec<String>,
     env: Vec<String>,
     working_dir: &str,
-    _network_disabled: bool,
+    network_disabled: bool,
     monitor_security: bool,
 ) -> anyhow::Result<(i64, Vec<u8>, Vec<u8>, Vec<String>)> {
     if cmd.is_empty() {
         return Err(anyhow::anyhow!("empty command"));
     }
 
-    // In a real pure-Rust OCI context, you would `unshare` and configure namespaces here
-    // before executing to emulate network disabling and drop capabilities. 
-    // Since we are mocking the execution flow locally without Docker:
-    // (A full local sandbox would require Linux-specific `chroot` or user namespace logic)
-    
+    if network_disabled {
+        return Err(anyhow::anyhow!(
+            "network-disabled execution requires an enforced native sandbox"
+        ));
+    }
+
     let mut command = tokio::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
     command.current_dir(working_dir);
@@ -629,9 +770,14 @@ async fn execute_native(
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
-    let child = command.spawn().map_err(|e| anyhow::anyhow!("failed to spawn: {}", e))?;
-    
-    let result = child.wait_with_output().await.map_err(|e| anyhow::anyhow!("failed to wait: {}", e))?;
+    let child = command
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn: {}", e))?;
+
+    let result = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to wait: {}", e))?;
 
     let exit_code = result.status.code().unwrap_or(1) as i64;
     let stdout_buf = result.stdout;
@@ -643,8 +789,15 @@ async fn execute_native(
         let out_str = String::from_utf8_lossy(&stdout_buf);
         let err_str = String::from_utf8_lossy(&stderr_buf);
         for s in out_str.lines().chain(err_str.lines()) {
-            if s.contains("curl ") || s.contains("wget ") || s.contains("chmod ") || s.contains("nc ") {
-                let warn = format!("[SECURITY WARN] Suspicious runtime activity detected: {}", s);
+            if s.contains("curl ")
+                || s.contains("wget ")
+                || s.contains("chmod ")
+                || s.contains("nc ")
+            {
+                let warn = format!(
+                    "[SECURITY WARN] Suspicious runtime activity detected: {}",
+                    s
+                );
                 println!("{}", warn);
                 anomalies.push(s.trim().to_string());
             }
@@ -662,11 +815,21 @@ async fn execute_build(
     if recipe.build.command.is_empty() {
         return Err(AppError::bad_request("recipe build command is empty"));
     }
+    if recipe.build.run_command.is_some() {
+        return Err(AppError::bad_request(
+            "build.run_command requires an enforced native sandbox and is not supported yet",
+        ));
+    }
 
     let started_at = timestamp();
     let working_dir = resolve_working_dir(recipe, &state.work_dir)?;
-    
-    let env: Vec<String> = request.environment.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    let mut notes = Vec::new();
+
+    let env: Vec<String> = request
+        .environment
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
 
     // 1. Build Phase (network allowed)
     let (build_exit, mut stdout_buf, mut stderr_buf, mut all_anomalies) = execute_native(
@@ -675,30 +838,56 @@ async fn execute_build(
         &working_dir.to_string_lossy(),
         false, // network_disabled = false
         false, // monitor_security = false
-    ).await.unwrap_or((1, Vec::new(), Vec::new(), Vec::new()));
+    )
+    .await
+    .unwrap_or_else(|error| {
+        notes.push(format!("build command failed before completion: {error}"));
+        (
+            1,
+            Vec::new(),
+            format!("build command failed before completion: {error}\n").into_bytes(),
+            Vec::new(),
+        )
+    });
 
     let mut exit_code = Some(build_exit);
 
-    // 2. Run / Scan Phase (network mocked to disabled, monitor for C2)
+    // 2. Run / Scan Phase. Fail closed unless network isolation is actually enforced.
     if build_exit == 0 {
         if let Some(run_cmd) = &recipe.build.run_command {
-            let (run_exit, run_stdout, run_stderr, run_anomalies) = execute_native(
+            stdout_buf.extend_from_slice(
+                b"
+--- RUN PHASE ---
+",
+            );
+            stderr_buf.extend_from_slice(
+                b"
+--- RUN PHASE ---
+",
+            );
+
+            match execute_native(
                 run_cmd.clone(),
                 env,
                 &working_dir.to_string_lossy(),
-                true,  // network_disabled = true
-                true,  // monitor_security = true
-            ).await.unwrap_or((1, Vec::new(), Vec::new(), Vec::new()));
-            exit_code = Some(run_exit);
-            stdout_buf.extend_from_slice(b"
---- RUN PHASE ---
-");
-            stdout_buf.extend_from_slice(&run_stdout);
-            stderr_buf.extend_from_slice(b"
---- RUN PHASE ---
-");
-            stderr_buf.extend_from_slice(&run_stderr);
-            all_anomalies.extend(run_anomalies);
+                true, // network_disabled = true
+                true, // monitor_security = true
+            )
+            .await
+            {
+                Ok((run_exit, run_stdout, run_stderr, run_anomalies)) => {
+                    exit_code = Some(run_exit);
+                    stdout_buf.extend_from_slice(&run_stdout);
+                    stderr_buf.extend_from_slice(&run_stderr);
+                    all_anomalies.extend(run_anomalies);
+                }
+                Err(error) => {
+                    exit_code = Some(1);
+                    notes.push(format!("run command refused: {error}"));
+                    stderr_buf
+                        .extend_from_slice(format!("run command refused: {error}\n").as_bytes());
+                }
+            }
         }
     }
 
@@ -708,7 +897,6 @@ async fn execute_build(
         BuildStatus::Failed
     };
 
-    let mut notes = Vec::new();
     let artifact = read_artifact_ref(
         state,
         recipe,
@@ -754,9 +942,12 @@ async fn read_artifact_ref(
     };
 
     if artifact.is_absolute()
-        || artifact
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        || artifact.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
     {
         *status = BuildStatus::Failed;
         notes.push(format!(
@@ -833,7 +1024,6 @@ fn resolve_working_dir(recipe: &Recipe, work_dir: &std::path::Path) -> anyhow::R
     }
     Ok(canon)
 }
-
 
 fn tail_lossy(bytes: &[u8], max: usize) -> String {
     let lossy = String::from_utf8_lossy(bytes);

@@ -129,6 +129,9 @@ fn reconstruct_oci_archive(
         .and_then(|config| config.get("digest"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    if let Some(digest) = config_digest.as_deref() {
+        let _ = blob_path(archive_dir, digest)?;
+    }
     let tags = manifest_descriptor
         .get("annotations")
         .and_then(|annotations| annotations.get("org.opencontainers.image.ref.name"))
@@ -152,6 +155,13 @@ fn reconstruct_oci_archive(
         unpack_tar(&layer_path, rootfs, true)
             .with_context(|| format!("unpacking OCI layer {digest}"))?;
         let size = fs::metadata(&layer_path)?.len();
+        if let Some(expected_size) = layer.get("size").and_then(Value::as_u64) {
+            if expected_size != size {
+                bail!(
+                    "OCI layer {digest} size mismatch: descriptor declared {expected_size}, found {size}"
+                );
+            }
+        }
         layers.push(ImageLayerMetadata {
             digest,
             media_type: layer
@@ -190,12 +200,12 @@ fn unpack_tar(path: &Path, destination: &Path, apply_whiteouts: bool) -> anyhow:
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let header_type = entry.header().entry_type();
         if header_type.is_symlink() || header_type.is_hard_link() {
             continue; // Skip symlinks and hardlinks to prevent relative path breakouts
         }
-        
+
         entry.unpack(&target)?;
     }
     Ok(())
@@ -271,9 +281,16 @@ fn blob_path(archive_dir: &Path, digest: &str) -> anyhow::Result<PathBuf> {
     let Some((algorithm, value)) = digest.split_once(':') else {
         bail!("invalid OCI digest {digest}")
     };
+    if algorithm != "sha256" {
+        bail!("unsupported OCI digest algorithm {algorithm}")
+    }
     let path = archive_dir.join("blobs").join(algorithm).join(value);
     if !path.exists() {
         bail!("OCI blob not found for digest {digest}")
+    }
+    let (actual, _) = file_digest(&path)?;
+    if actual != digest {
+        bail!("OCI blob digest mismatch for {digest}: found {actual}")
     }
     Ok(path)
 }
@@ -306,3 +323,34 @@ fn file_digest(path: &Path) -> anyhow::Result<(String, u64)> {
     Ok((format!("sha256:{}", hex::encode(digest.finalize())), size))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_path_accepts_matching_sha256_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"layer bytes";
+        let digest = crate::digest::digest_bytes(bytes);
+        let (_, value) = digest.split_once(':').unwrap();
+        let blob_dir = temp.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let path = blob_dir.join(value);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(blob_path(temp.path(), &digest).unwrap(), path);
+    }
+
+    #[test]
+    fn blob_path_rejects_sha256_digest_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let (_, value) = digest.split_once(':').unwrap();
+        let blob_dir = temp.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(blob_dir.join(value), b"different layer bytes").unwrap();
+
+        let error = blob_path(temp.path(), &digest).unwrap_err().to_string();
+        assert!(error.contains("OCI blob digest mismatch"));
+    }
+}

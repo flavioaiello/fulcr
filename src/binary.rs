@@ -254,7 +254,6 @@ fn extract_interesting_strings(bytes: &[u8]) -> Vec<String> {
     strings.into_iter().take(MAX_BINARY_STRINGS).collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,10 +1,34 @@
 # fulcr
 
-`fulcr` is the developer registry that protects containerized developer environments (such as DevContainers). It is an OCI-compliant, metadata-first registry that treats image bytes and build outputs as disposable evidence, while preserving the source, dependency, cryptographic, vulnerability, provenance, and policy metadata needed to decide whether a developer workstation, CI runner, or runtime should ever receive those bytes.
+`fulcr` is a metadata-first OCI registry for virtual container images. It protects containerized developer environments such as DevContainers by treating source, locked inputs, builder identity, SBOM, CBOM, VEX, SLSA provenance, scans, attestations, and policy decisions as the durable artifact. Image bytes are generated ad hoc only when an OCI client asks for them, streamed with compliant descriptors, and then discarded or cached only under explicit retention policy.
 
-The security value is developer-environment protection: dependencies, build scripts, package metadata, provenance, and crypto posture are evaluated before an image is materialized or pulled into a place where credentials, source code, package tokens, or CI secrets exist. The storage value remains important too: registries often retain huge amounts of image and layer data that are never pulled again, while `fulcr` keeps the proof instead of the pile.
+The value proposition is both security and storage: unsafe images are never materialized into developer workstations, CI runners, or runtimes, and rarely reused image layers do not accumulate as permanent registry state. Conventional registries keep the pile of image blobs first and attach proof later; `fulcr` keeps the proof first and creates the pile only when policy allows it.
 
 Source, locked inputs, builder identity, policy, SBOM, CBOM, VEX, SLSA provenance, scans, and attestations are the durable truth. Pushed image bytes, rebuilt layers, compiled binaries, and build intermediates are temporary evidence unless an explicit retention policy says otherwise.
+
+## Virtual Image Model
+
+`fulcr` turns an image reference into a policy-gated projection of source and metadata:
+
+```text
+Git/source + recipe + metadata
+     |
+     v
+fulcr metadata gate
+     |
+   allow? deny?
+  |      |
+  v      v
+generate OCI bytes ad hoc      no build, no stream
+  |
+  v
+stream manifest/config/layers
+  |
+  v
+discard or short-cache bytes
+```
+
+From the OCI client's perspective, the pull still uses normal manifests, descriptors, digests, blobs, and referrers. Internally, the image is a source-bound stub until the metadata gate allows `fulcr` to materialize bytes for that request.
 
 ## The DevContainer Protection Model
 
@@ -374,18 +398,18 @@ GET  /v1/recipes/:id/attestation
 
 ## Storage Policy
 
-`fulcr` MUST optimize for protected developer environments and avoided binary storage.
+`fulcr` MUST make the virtual-image model measurable: protected materialization decisions, ad-hoc bytes served, durable metadata retained, and binary storage avoided.
 
 The registry SHOULD measure and report:
 
-- synthetic image bytes served
-- binary bytes not retained
+- synthetic image bytes generated and streamed
+- binary bytes discarded or intentionally not retained
 - estimated storage avoided versus a conventional blob-preserving registry
 - metadata size retained per image reference
 - ad-hoc builds served by source revision and recipe digest
 - denied materialization due to VEX, SBOM posture, CBOM posture, SLSA posture, scan findings, ad-hoc binaries, crypto drift, or metadata misalignment
 
-This makes the value proposition observable: keep risky bytes away from developer environments, and keep the proof instead of the pile of rarely reused binary blobs.
+This makes the value proposition observable: source and metadata become the durable image stub, policy decides whether bytes may exist, and `fulcr` keeps the proof instead of the pile of rarely reused binary blobs.
 
 ## Run
 

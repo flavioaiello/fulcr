@@ -58,6 +58,45 @@ impl Recipe {
     }
 }
 
+pub fn oci_image_config(recipe: &Recipe, diff_ids: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "architecture": "unknown",
+        "os": "unknown",
+        "created": recipe.created_at,
+        "config": {
+            "Labels": {
+                "org.opencontainers.image.source": recipe.source.repo.clone(),
+                "org.opencontainers.image.revision": recipe.source.revision.clone(),
+                "dev.fulcr.recipe.id": recipe.id.to_string(),
+                "dev.fulcr.recipe.digest": recipe.digest.clone(),
+                "dev.fulcr.materialized": "false",
+                "dev.fulcr.retention": if recipe.policy.retain_artifact { "selective" } else { "ephemeral" }
+            }
+        },
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": diff_ids
+        },
+        "history": [{
+            "created": recipe.created_at.clone(),
+            "created_by": "fulcr metadata-only materialization",
+            "comment": "fulcr emitted a standards-shaped OCI config without retained image layers",
+            "empty_layer": true
+        }]
+    })
+}
+
+pub fn oci_image_config_bytes(recipe: &Recipe) -> anyhow::Result<Vec<u8>> {
+    oci_image_config_bytes_for_layers(recipe, &[])
+}
+
+pub fn oci_image_config_bytes_for_layers(
+    recipe: &Recipe,
+    diff_ids: &[String],
+) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(&oci_image_config(recipe, diff_ids)).context("serializing OCI image config")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRef {
     pub repo: String,
@@ -164,7 +203,6 @@ pub enum ScanMode {
     Filesystem,
     ImageArchive,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanReport {

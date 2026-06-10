@@ -29,12 +29,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let work_dir = std::fs::canonicalize(&args.work_dir)
-        .unwrap_or_else(|_| args.work_dir.clone());
+    let work_dir = std::fs::canonicalize(&args.work_dir).unwrap_or_else(|_| args.work_dir.clone());
     let store = Store::open(args.data_dir)
         .await
         .context("opening fulcr data store")?;
-        
+
     let store_clone = store.clone();
     tokio::spawn(async move {
         cache_sweep_loop(store_clone).await;

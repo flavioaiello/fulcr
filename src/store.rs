@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::models::{BuildRecord, Recipe, ScanReport, VexStatement};
+use crate::models::{oci_image_config_bytes, BuildRecord, Recipe, ScanReport, VexStatement};
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -53,9 +53,12 @@ impl Store {
             if crate::store::is_json_file(&path) {
                 if let Ok(bytes) = fs::read(&path).await {
                     if let Ok(recipe) = serde_json::from_slice::<Recipe>(&bytes) {
-                        index.insert(format!("{}:{}", recipe.name, recipe.source.revision), recipe.id);
+                        index.insert(
+                            format!("{}:{}", recipe.name, recipe.source.revision),
+                            recipe.id,
+                        );
                         index.insert(recipe.digest.clone(), recipe.id);
-                        if let Ok(config) = serde_json::to_vec(&recipe) {
+                        if let Ok(config) = oci_image_config_bytes(&recipe) {
                             blobs.insert(crate::digest::digest_bytes(&config), recipe.id);
                         }
                     }
@@ -82,8 +85,12 @@ impl Store {
                 if !is_json_file(&entry.path()) {
                     continue;
                 }
-                let Ok(bytes) = fs::read(entry.path()).await else { continue };
-                let Ok(recipe) = serde_json::from_slice::<Recipe>(&bytes) else { continue };
+                let Ok(bytes) = fs::read(entry.path()).await else {
+                    continue;
+                };
+                let Ok(recipe) = serde_json::from_slice::<Recipe>(&bytes) else {
+                    continue;
+                };
                 let ttl = recipe.policy.cache_ttl_seconds;
                 let builds = self.list_builds(recipe.id).await.unwrap_or_default();
                 for build in builds {
@@ -126,9 +133,12 @@ impl Store {
     pub async fn save_recipe(&self, recipe: &Recipe) -> anyhow::Result<()> {
         self.write_json(self.recipe_path(recipe.id), recipe).await?;
         let mut index = self.recipe_index.lock().await;
-        index.insert(format!("{}:{}", recipe.name, recipe.source.revision), recipe.id);
+        index.insert(
+            format!("{}:{}", recipe.name, recipe.source.revision),
+            recipe.id,
+        );
         index.insert(recipe.digest.clone(), recipe.id);
-        if let Ok(config) = serde_json::to_vec(recipe) {
+        if let Ok(config) = oci_image_config_bytes(recipe) {
             self.blob_index
                 .lock()
                 .await
@@ -137,14 +147,19 @@ impl Store {
         Ok(())
     }
 
-    pub async fn lookup_recipe(&self, name: &str, reference: &str) -> anyhow::Result<Option<Recipe>> {
+    pub async fn lookup_recipe(
+        &self,
+        name: &str,
+        reference: &str,
+    ) -> anyhow::Result<Option<Recipe>> {
         let id_opt = {
             let index = self.recipe_index.lock().await;
-            index.get(&format!("{}:{}", name, reference))
+            index
+                .get(&format!("{}:{}", name, reference))
                 .or_else(|| index.get(reference))
                 .copied()
         };
-        
+
         if let Some(id) = id_opt {
             self.get_recipe(id).await
         } else {

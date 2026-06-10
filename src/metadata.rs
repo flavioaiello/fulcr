@@ -75,6 +75,7 @@ pub fn cbom_document(recipe: &Recipe) -> Value {
 pub fn openvex_document(recipe: &Recipe, statements: &[VexStatement]) -> Value {
     let statements: Vec<Value> = statements
         .iter()
+        .filter(|statement| statement.recipe_digest == recipe.digest)
         .map(|statement| {
             json!({
                 "vulnerability": { "name": statement.vulnerability },
@@ -404,7 +405,10 @@ fn sha256_value(digest: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{BuilderKind, BuilderRef, Material, Recipe, RecipeInput, SourceRef};
+    use crate::models::{
+        timestamp, BuilderKind, BuilderRef, Material, Recipe, RecipeInput, SourceRef, VexStatement,
+        VexStatus,
+    };
 
     use super::*;
 
@@ -473,5 +477,64 @@ mod tests {
                 .as_array()
                 .is_some_and(|findings| !findings.is_empty())
         );
+    }
+
+    #[test]
+    fn openvex_document_filters_stale_recipe_digest_statements() {
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "abc123".to_string(),
+                path: None,
+            },
+            builder: BuilderRef {
+                kind: BuilderKind::Containerfile,
+                name: Some("builder".to_string()),
+                digest: Some("sha256:1234".to_string()),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+
+        let openvex = openvex_document(
+            &recipe,
+            &[
+                VexStatement {
+                    id: uuid::Uuid::new_v4(),
+                    recipe_id: recipe.id,
+                    recipe_digest: recipe.digest.clone(),
+                    created_at: timestamp(),
+                    vulnerability: "CVE-2026-0001".to_string(),
+                    status: VexStatus::NotAffected,
+                    product: None,
+                    component: None,
+                    justification: None,
+                    detail: None,
+                    author: None,
+                },
+                VexStatement {
+                    id: uuid::Uuid::new_v4(),
+                    recipe_id: recipe.id,
+                    recipe_digest: "sha256:stale".to_string(),
+                    created_at: timestamp(),
+                    vulnerability: "CVE-2026-0002".to_string(),
+                    status: VexStatus::Affected,
+                    product: None,
+                    component: None,
+                    justification: None,
+                    detail: None,
+                    author: None,
+                },
+            ],
+        );
+
+        let statements = openvex["statements"].as_array().unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0]["vulnerability"]["name"], "CVE-2026-0001");
     }
 }

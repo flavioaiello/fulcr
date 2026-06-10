@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "axon": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/axon",
+      "args": ["serve", "--workspace", "${workspaceFolder}"]
+    }
+  }
+}
