@@ -1,0 +1,29 @@
+{
+  "name": "hello-service",
+  "source": {
+    "repo": "https://example.invalid/hello-service.git",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "path": "."
+  },
+  "builder": {
+    "kind": "script",
+    "name": "local-dev-builder",
+    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "build": {
+    "command": ["/bin/sh", "-c", "tar -cf layer.tar README.md"],
+    "artifact": "layer.tar"
+  },
+  "materials": [
+    {
+      "name": "README.md",
+      "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "kind": "source-file"
+    }
+  ],
+  "policy": {
+    "durable_metadata_only": true,
+    "retain_artifact": false,
+    "cache_ttl_seconds": 900
+  }
+}

@@ -1,14 +1,14 @@
 # fulcr
 
-`fulcr` is a metadata-first OCI registry for virtual container images. It protects containerized developer environments such as DevContainers by treating source, locked inputs, builder identity, SBOM, CBOM, VEX, SLSA provenance, scans, attestations, and policy decisions as the durable artifact. Image bytes are generated ad hoc only when an OCI client asks for them, streamed with compliant descriptors, and then discarded or cached only under explicit retention policy.
+`fulcr` is a metadata-first virtual OCI registry for containerized developer environments such as DevContainers. It treats source, locked inputs, builder identity, SBOM, CBOM, VEX, SLSA provenance, scans, attestations, and policy decisions as the durable artifact. Image bytes are derived materializations: they may be built explicitly, cached temporarily, served through normal OCI read paths, or denied by policy, but they are not the registry's source of truth.
 
 The value proposition is both security and storage: unsafe images are never materialized into developer workstations, CI runners, or runtimes, and rarely reused image layers do not accumulate as permanent registry state. Conventional registries keep the pile of image blobs first and attach proof later; `fulcr` keeps the proof first and creates the pile only when policy allows it.
 
-Source, locked inputs, builder identity, policy, SBOM, CBOM, VEX, SLSA provenance, scans, and attestations are the durable truth. Pushed image bytes, rebuilt layers, compiled binaries, and build intermediates are temporary evidence unless an explicit retention policy says otherwise.
+Source, locked inputs, builder identity, policy, SBOM, CBOM, VEX, SLSA provenance, scans, and attestations are the durable truth. Pushed image bytes, rebuilt layers, compiled binaries, and build intermediates are temporary evidence unless an explicit retention policy says otherwise. The prototype currently serves pullable image content only when a recipe build has produced and retained an uncompressed OCI layer tar.
 
 ## Virtual Image Model
 
-`fulcr` turns an image reference into a policy-gated projection of source and metadata:
+`fulcr` turns an image reference into a policy-gated projection of source and metadata. Materialization is a derived state, not the primary registry record:
 
 ```text
 Git/source + recipe + metadata
@@ -19,16 +19,18 @@ fulcr metadata gate
    allow? deny?
   |      |
   v      v
-generate OCI bytes ad hoc      no build, no stream
+serve approved materialization     no build, no stream
   |
   v
 stream manifest/config/layers
   |
   v
-discard or short-cache bytes
+discard, retain, or short-cache bytes by policy
 ```
 
-From the OCI client's perspective, the pull still uses normal manifests, descriptors, digests, blobs, and referrers. Internally, the image is a source-bound stub until the metadata gate allows `fulcr` to materialize bytes for that request.
+From the OCI client's perspective, successful reads still use normal manifests, descriptors, digests, blobs, and referrers. Internally, the image is a source-bound metadata record until an explicit or pre-existing materialization supplies descriptors and bytes that `fulcr` can serve without violating OCI client expectations. Pull-time build may be a future optimization for fast, deterministic cases, but it is not the core contract.
+
+Release tags and digest references SHOULD resolve to stable recipe or materialization identity. Floating development references MAY point at changing source revisions, but they still become pullable only after metadata is accepted and any required materialization exists.
 
 ## The DevContainer Protection Model
 
@@ -46,7 +48,7 @@ The malicious payload is never executed because `fulcr` refuses to hand over the
 
 The registry MUST expose standard OCI Distribution API behavior for OCI clients, including `/v2/`, manifest access, content descriptors, media types, digest-addressed blobs, and OCI artifact references where metadata documents are attached. It MUST NOT require proprietary client behavior for image pull, manifest resolution, or artifact discovery.
 
-Binary content MUST be disposable. During push or image intake, `fulcr` MAY temporarily hold image layers, config blobs, compiled binaries, and archives long enough to scan them and create metadata. During pull, `fulcr` MAY cache transient build intermediates for the active request. In both cases, it MUST NOT preserve image layers, config blobs, compiled binaries, image archives, or build outputs as durable registry state unless an explicit retention policy allows it.
+Binary content MUST be disposable. During future push or image intake, `fulcr` MAY temporarily hold image layers, config blobs, compiled binaries, and archives long enough to scan them and create metadata. During explicit materialization, `fulcr` MAY cache build outputs long enough to satisfy normal OCI reads. In both cases, it MUST NOT preserve image layers, config blobs, compiled binaries, image archives, or build outputs as durable registry state unless an explicit retention policy allows it.
 
 ## Metadata Engine
 
@@ -58,7 +60,7 @@ Binary content MUST be disposable. During push or image intake, `fulcr` MAY temp
 - SLSA provenance records the source, builder, materials, parameters, byproducts, and build/run details in a standard in-toto statement shape.
 - Scan reports capture source, filesystem, image, and binary evidence used by the metadata gate.
 
-The registry MUST store and process metadata as first-class OCI artifacts. It MUST use metadata and VEX risk to decide whether an image can be materialized for pull. It MUST NOT use retained binary blobs as the source of truth, and it MUST deny materialization before risky content reaches developer environments.
+The registry MUST store and process metadata as first-class OCI artifacts. It MUST use metadata and VEX risk to decide whether an image can be materialized or served. It MUST NOT use retained binary blobs as the source of truth, and it MUST deny materialization before risky content reaches developer environments.
 
 ## Native Scanner
 
@@ -97,7 +99,7 @@ The current scanner detects:
 
 The scanner also turns SBOM and CBOM into gateable posture evidence. SBOM policy findings are emitted for unpinned dependency specs, missing lockfile integrity hashes, direct or local dependency sources that require provenance review, npm lifecycle scripts, and package scripts that reference tokens, registries, or publishing behavior. CBOM policy findings are emitted for private key material, legacy protocols, weak algorithms, weak key-size hints, SHA-1 or MD5 signature hints, and expired crypto library families such as OpenSSL 1.0.x or 1.1.1.
 
-These controls intentionally sit beside VEX rather than replacing it. SBOM/CBOM findings answer whether the dependency and crypto posture is acceptable before a synthetic image is materialized; VEX answers whether a known vulnerability is exploitable in this image context. 
+These controls intentionally sit beside VEX rather than replacing it. SBOM/CBOM findings answer whether the dependency and crypto posture is acceptable before a derived image is materialized; VEX answers whether a known vulnerability is exploitable in this image context.
 
 To bridge the gap between abstract metadata and real-world exploitation, `fulcr` employs a hybrid VEX (Vulnerability Exploitability eXchange) model:
 
@@ -145,7 +147,7 @@ SLSA is not the whole security model. In `fulcr`, SLSA is the interoperable prov
 - scan findings for ad-hoc binaries, suspicious build behavior, or metadata misalignment
 - VEX candidates that still require triage
 
-Build execution and OCI manifest resolution call the same gate. If the latest metadata is denied, `fulcr` refuses to build or serve a manifest for that recipe.
+Build execution and OCI manifest resolution call the same gate. If the latest metadata is denied, `fulcr` refuses to build, materialize, or serve a manifest for that recipe.
 
 ## Future Sandbox Extension
 
@@ -159,14 +161,16 @@ Runtime sandboxing is intentionally not part of the current implementation. It c
 |---|---|---|
 | Developer | Pull, build, or inspect a dependency-backed image | Receives only images whose dependency, crypto, VEX, and provenance posture passed the metadata gate |
 | CI runner | Build or test source-bound artifacts | Gets an allow/deny decision before build scripts can execute with CI credentials or package tokens nearby |
-| Image producer | Push or register a release artifact | Pushes an image for temporary intake or registers source metadata directly |
-| OCI registry | Serve manifests, descriptors, blobs, and referrers | Scans pushed bytes, deletes them, resolves metadata, and synthesizes requested image bytes on demand |
-| OCI client | Pull an image by tag or digest | Receives an OCI-compliant manifest and byte streams without knowing the image was built ad hoc |
+| Image producer | Register source metadata or future pushed-image evidence | Registers recipes today; future push intake can convert uploaded bytes into metadata |
+| OCI registry | Serve manifests, descriptors, blobs, and referrers | Resolves metadata, applies the gate, and serves only approved available materializations |
+| OCI client | Pull an image by tag or digest | Receives OCI-compliant manifests and byte streams only when descriptors and blobs are already available to serve |
 | Runtime or orchestrator | Deploy an image | Pulls through standard OCI behavior and enforces digest identity |
 | Security scanner | Discover SBOM, CBOM, VEX, SLSA, and attestations | Reads OCI artifacts and referrers attached to the recipe or image digest |
 | Auditor | Trace deployed software to source and evidence | Reviews recipe, materials, metadata digests, SLSA provenance, VEX status, and build records |
 
-## Push Intake Flow
+## Future Push Intake Flow
+
+Push intake is not implemented in the current prototype. When added, push remains an ingestion path for evidence rather than durable blob storage:
 
 ```text
 OCI producer pushes image
@@ -198,20 +202,20 @@ fulcr resolves source-bound recipe and metadata
 fulcr evaluates SBOM, CBOM, VEX, SLSA provenance, scans, policy, and attestations
         |
         v
-if allowed by metadata policy, fulcr builds or materializes image content ad hoc
+if allowed and materialized content exists, fulcr prepares OCI descriptors
         |
         v
 fulcr streams manifest/config/layers with compliant digests
         |
         v
-fulcr records evidence and discards generated binary bytes unless retention policy allows caching
+fulcr keeps metadata durable and retains/caches bytes only by explicit policy
 ```
 
-If VEX risk or policy denies the request, `fulcr` MUST NOT build the image and MUST return an OCI-compliant error response.
+If VEX risk or policy denies the request, `fulcr` MUST NOT build, materialize, or stream image bytes and MUST return an OCI-compliant error response. If policy allows the request but no approved materialization exists, `fulcr` MUST fail closed rather than block the pull on an unbounded build. Operators can create materialization through the metadata API before retrying the OCI pull.
 
 ## VEX Risk Gate
 
-VEX is the gate between preserved metadata and synthetic binary reconstruction.
+VEX is the gate between preserved metadata and derived binary materialization.
 
 | VEX Status | Default Build/Pull Decision | Rationale |
 |---|---|---|
@@ -221,7 +225,7 @@ VEX is the gate between preserved metadata and synthetic binary reconstruction.
 | `under_investigation` | Deny by default for production | The registry cannot yet prove acceptable risk |
 | missing VEX for required CVE | Deny by default for production | The registry lacks an accountable exploitability statement |
 
-The policy engine MAY vary these defaults by environment, but it MUST record the decision as durable metadata. A denied pull MUST NOT trigger an ad-hoc build.
+The policy engine MAY vary these defaults by environment, but it MUST record the decision as durable metadata. A denied pull MUST NOT trigger materialization.
 
 ## Gherkin Requirements
 
@@ -252,8 +256,9 @@ Feature: Developer registry that protects developer environments
     And the manifest MUST contain valid OCI media types, descriptors, sizes, and digests
     And the manifest SHOULD expose SBOM, CBOM, VEX, SLSA, and attestation metadata through OCI artifact references
 
-  Scenario: OCI producer pushes an image for temporary intake
-    Given an OCI producer has an image manifest, config blob, and layer blobs
+  Scenario: Future OCI push intake converts bytes to metadata
+    Given push intake support is enabled
+    And an OCI producer has an image manifest, config blob, and layer blobs
     When the producer pushes the image to the registry
     Then the registry MUST accept the push through standard OCI Distribution behavior
     And the registry MUST treat the pushed binaries as temporary intake
@@ -262,9 +267,9 @@ Feature: Developer registry that protects developer environments
     And the registry MUST preserve OCI manifest information as metadata
     And the registry MUST delete config blobs, layer blobs, image archives, and compiled binaries so they are not durable binary state
 
-  Scenario: Image pull builds the image ad hoc
-    Given no durable image layer exists in registry storage
-    And VEX risk and policy allow reconstruction
+  Scenario: OCI pull serves an approved materialization
+    Given an approved materialization exists for "hello-service:1.0.0"
+    And VEX risk and policy allow serving it
     When an OCI client pulls "hello-service:1.0.0"
     Then the registry MUST resolve the source recipe
     And the registry MUST evaluate SBOM, CBOM, VEX, SLSA, scan, and policy metadata
@@ -274,8 +279,8 @@ Feature: Developer registry that protects developer environments
   Scenario: Metadata gate denies build and pull
     Given VEX risk, scan evidence, or policy marks "hello-service:1.0.0" as not allowed for the requested environment
     When an OCI client pulls "hello-service:1.0.0"
-    Then the registry MUST NOT build the image
-    And the registry MUST NOT stream synthetic image bytes
+    Then the registry MUST NOT materialize the image
+    And the registry MUST NOT stream derived image bytes
     And the registry MUST return an OCI-compliant error response
     And the registry SHOULD expose the denial reason through metadata, audit evidence, or policy logs
 
@@ -300,8 +305,8 @@ Feature: Developer registry that protects developer environments
     And the registry MUST preserve the SLSA posture finding as durable evidence
     And the registry MUST expose the policy outcome in the SLSA predicate metadata
 
-  Scenario: Binary output is synthetic and not preserved
-    Given a push intake or ad-hoc build produced image config and layer bytes
+  Scenario: Binary output is derived and not preserved by default
+    Given a push intake or explicit materialization produced image config and layer bytes
     When the registry has created metadata or streamed the requested bytes to the OCI client
     Then the registry MUST record metadata evidence for the intake or build
     And the registry MUST discard pushed or generated binary bytes
@@ -318,7 +323,7 @@ Feature: Developer registry that protects developer environments
     When the registry generates metadata for the release
     Then the registry MUST produce an SBOM describing expected software components
     And the SBOM SHOULD be attached as an OCI artifact
-    And scanners MAY consume the SBOM without pulling the synthetic image bytes
+    And scanners MAY consume the SBOM without pulling derived image bytes
 
   Scenario: CBOM drives cryptographic inventory
     Given the recipe includes cryptographic materials or crypto-relevant configuration
@@ -331,7 +336,7 @@ Feature: Developer registry that protects developer environments
     Given a vulnerability scanner reports a CVE for a component in the SBOM
     When a VEX statement exists for the recipe and source revision
     Then the registry MUST expose the VEX status as OCI metadata
-    And the registry MUST use VEX and policy to decide whether build and pull are allowed
+    And the registry MUST use VEX and policy to decide whether materialization and pull are allowed
     And the registry MUST NOT treat component presence alone as proof of exploitability
 
   Scenario: SLSA records source-bound provenance
@@ -346,7 +351,7 @@ Feature: Developer registry that protects developer environments
     Given the client is an OCI runtime, orchestrator, scanner, auditor, or registry tool
     When the client uses standard OCI distribution flows
     Then the registry MUST present standard OCI resources and media types
-    And the client SHOULD NOT need to understand the internal ad-hoc build mechanism
+    And the client SHOULD NOT need to understand the internal materialization mechanism
     And proprietary use-cases MAY exist only outside the OCI compatibility boundary
 
   Scenario: Storage savings are measurable
@@ -368,11 +373,11 @@ HEAD /v2/<name>/manifests/<reference>
 GET  /v2/<name>/blobs/<digest>
 HEAD /v2/<name>/blobs/<digest>
 GET  /v2/<name>/referrers/<digest>
-POST /v2/<name>/blobs/uploads/
-PATCH /v2/<name>/blobs/uploads/<uuid>
-PUT  /v2/<name>/blobs/uploads/<uuid>?digest=<digest>
-PUT  /v2/<name>/manifests/<reference>
 ```
+
+Push/upload endpoints are not implemented yet; this prototype currently accepts recipes and evidence through the metadata API and serves policy-gated OCI read paths.
+
+Metadata API routes and OCI content routes require `Authorization: Bearer <fulcr_TOKEN>`. `/healthz` and `/v2/` remain open for local inspection.
 
 The metadata API is an administrative interface for recipes, policy, and evidence. It MUST NOT replace OCI client compatibility:
 
@@ -398,15 +403,15 @@ GET  /v1/recipes/:id/attestation
 
 ## Storage Policy
 
-`fulcr` MUST make the virtual-image model measurable: protected materialization decisions, ad-hoc bytes served, durable metadata retained, and binary storage avoided.
+`fulcr` MUST make the virtual-image model measurable: protected materialization decisions, derived bytes served, durable metadata retained, and binary storage avoided.
 
 The registry SHOULD measure and report:
 
-- synthetic image bytes generated and streamed
+- derived image bytes generated and streamed
 - binary bytes discarded or intentionally not retained
 - estimated storage avoided versus a conventional blob-preserving registry
 - metadata size retained per image reference
-- ad-hoc builds served by source revision and recipe digest
+- explicit materializations served by source revision and recipe digest
 - denied materialization due to VEX, SBOM posture, CBOM posture, SLSA posture, scan findings, ad-hoc binaries, crypto drift, or metadata misalignment
 
 This makes the value proposition observable: source and metadata become the durable image stub, policy decides whether bytes may exist, and `fulcr` keeps the proof instead of the pile of rarely reused binary blobs.
@@ -414,6 +419,7 @@ This makes the value proposition observable: source and metadata become the dura
 ## Run
 
 ```bash
+export fulcr_TOKEN=replace-with-local-token
 cargo run -- --bind 127.0.0.1:8080 --data-dir .fulcr
 ```
 
@@ -422,6 +428,7 @@ Register a recipe:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $fulcr_TOKEN" \
   --data @examples/recipe.json | jq .
 ```
 
@@ -430,6 +437,7 @@ Create source scan evidence before materialization:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/scans \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $fulcr_TOKEN" \
   --data '{"mode":"source"}' | jq .
 ```
 
@@ -438,9 +446,11 @@ Add VEX metadata:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/vex \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $fulcr_TOKEN" \
   --data '{
     "vulnerability": "CVE-2026-1234",
     "status": "not_affected",
+    "recipe_digest": "<recipe-digest-from-recipe-response>",
     "component": "example-lib",
     "justification": "vulnerable_code_not_present",
     "detail": "The vulnerable parser is excluded by this build profile.",
@@ -451,15 +461,26 @@ curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/vex \
 Request SLSA provenance:
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/recipes/<recipe-id>/slsa | jq .
+curl -sS http://127.0.0.1:8080/v1/recipes/<recipe-id>/slsa \
+  -H "authorization: Bearer $fulcr_TOKEN" | jq .
 ```
 
-Plan an ad-hoc build without storing bytes:
+Plan a materialization record without executing a build:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/builds \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $fulcr_TOKEN" \
   --data '{"execute": false}' | jq .
+```
+
+To pre-materialize an image before the first OCI manifest request, run the recipe build and cache its OCI layer artifact:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/builds \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $fulcr_TOKEN" \
+  --data '{"execute": true, "cache_artifact": true}' | jq .
 ```
 
 Only run executable recipes from trusted local sources. `fulcr` is a prototype developer-protection registry, not a public multi-tenant build service.

@@ -41,7 +41,9 @@ pub struct Recipe {
 
 impl Recipe {
     pub fn new(input: RecipeInput) -> anyhow::Result<Self> {
-        let digest = digest_json(&input).context("digesting recipe")?;
+        let mut digest_input = input.clone();
+        digest_input.source.path = None;
+        let digest = digest_json(&digest_input).context("digesting recipe")?;
         Ok(Self {
             id: Uuid::new_v4(),
             digest,
@@ -59,6 +61,7 @@ impl Recipe {
 }
 
 pub fn oci_image_config(recipe: &Recipe, diff_ids: &[String]) -> serde_json::Value {
+    let materialized = !diff_ids.is_empty();
     serde_json::json!({
         "architecture": "unknown",
         "os": "unknown",
@@ -69,7 +72,7 @@ pub fn oci_image_config(recipe: &Recipe, diff_ids: &[String]) -> serde_json::Val
                 "org.opencontainers.image.revision": recipe.source.revision.clone(),
                 "dev.fulcr.recipe.id": recipe.id.to_string(),
                 "dev.fulcr.recipe.digest": recipe.digest.clone(),
-                "dev.fulcr.materialized": "false",
+                "dev.fulcr.materialized": if materialized { "true" } else { "false" },
                 "dev.fulcr.retention": if recipe.policy.retain_artifact { "selective" } else { "ephemeral" }
             }
         },
@@ -79,9 +82,9 @@ pub fn oci_image_config(recipe: &Recipe, diff_ids: &[String]) -> serde_json::Val
         },
         "history": [{
             "created": recipe.created_at.clone(),
-            "created_by": "fulcr metadata-only materialization",
-            "comment": "fulcr emitted a standards-shaped OCI config without retained image layers",
-            "empty_layer": true
+            "created_by": if materialized { "fulcr approved materialization" } else { "fulcr metadata-only materialization" },
+            "comment": if materialized { "fulcr emitted an OCI config for an approved retained layer artifact" } else { "fulcr emitted a standards-shaped OCI config without retained image layers" },
+            "empty_layer": !materialized
         }]
     })
 }
@@ -412,7 +415,10 @@ impl BuildRecord {
             stdout_tail: None,
             stderr_tail: None,
             security_anomalies: Vec::new(),
-            notes: vec!["metadata-only plan; artifact can be constructed ad hoc".to_string()],
+            notes: vec![
+                "metadata-only plan; execute a retained build to make an OCI layer pullable"
+                    .to_string(),
+            ],
         }
     }
 }
@@ -428,6 +434,10 @@ pub enum BuildStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub digest: String,
+    #[serde(default)]
+    pub diff_id: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
     pub size: u64,
     pub retained: bool,
     #[serde(default)]
@@ -522,4 +532,62 @@ fn default_true() -> bool {
 
 fn default_cache_ttl_seconds() -> u64 {
     900
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recipe_digest_ignores_local_source_path() {
+        let left = Recipe::new(recipe_input_with_path("/tmp/checkout-a")).unwrap();
+        let right = Recipe::new(recipe_input_with_path("/tmp/checkout-b")).unwrap();
+
+        assert_eq!(left.digest, right.digest);
+        assert_ne!(left.source.path, right.source.path);
+    }
+
+    #[test]
+    fn oci_config_marks_retained_layers_as_materialized() {
+        let recipe = Recipe::new(recipe_input_with_path("/tmp/checkout-a")).unwrap();
+        let layer_diff_id = format!("sha256:{}", "1".repeat(64));
+
+        let materialized = oci_image_config(&recipe, &[layer_diff_id]);
+        assert_eq!(
+            materialized["config"]["Labels"]["dev.fulcr.materialized"],
+            "true"
+        );
+        assert_eq!(materialized["history"][0]["empty_layer"], false);
+
+        let metadata_only = oci_image_config(&recipe, &[]);
+        assert_eq!(
+            metadata_only["config"]["Labels"]["dev.fulcr.materialized"],
+            "false"
+        );
+        assert_eq!(metadata_only["history"][0]["empty_layer"], true);
+    }
+
+    fn recipe_input_with_path(path: &str) -> RecipeInput {
+        RecipeInput {
+            name: "service".to_string(),
+            source: SourceRef {
+                repo: "https://example.invalid/service.git".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(PathBuf::from(path)),
+            },
+            builder: BuilderRef {
+                kind: BuilderKind::Script,
+                name: Some("builder".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        }
+    }
 }

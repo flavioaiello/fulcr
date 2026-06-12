@@ -13,6 +13,17 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 
 use crate::models::{ImageLayerMetadata, ImageScanMetadata};
 
+const DEFAULT_TAR_LIMITS: TarLimits = TarLimits {
+    max_entries: 100_000,
+    max_unpacked_bytes: 1_073_741_824,
+};
+
+#[derive(Clone, Copy)]
+struct TarLimits {
+    max_entries: u64,
+    max_unpacked_bytes: u64,
+}
+
 pub struct UnpackedImage {
     pub rootfs: PathBuf,
     pub metadata: ImageScanMetadata,
@@ -69,9 +80,9 @@ fn reconstruct_docker_archive(
     let config_digest = entry
         .get("Config")
         .and_then(Value::as_str)
-        .map(|config| archive_dir.join(config))
-        .filter(|path| path.exists())
-        .map(|path| file_digest(&path))
+        .map(|config| {
+            docker_archive_member_path(archive_dir, config).and_then(|path| file_digest(&path))
+        })
         .transpose()?
         .map(|(digest, _)| digest);
 
@@ -83,7 +94,7 @@ fn reconstruct_docker_archive(
         .flatten()
         .filter_map(Value::as_str)
     {
-        let layer_path = archive_dir.join(layer);
+        let layer_path = docker_archive_member_path(archive_dir, layer)?;
         unpack_tar(&layer_path, rootfs, true)
             .with_context(|| format!("unpacking Docker layer {layer}"))?;
         let (digest, size) = file_digest(&layer_path)?;
@@ -92,6 +103,22 @@ fn reconstruct_docker_archive(
             media_type: Some("application/vnd.docker.image.rootfs.diff.tar".to_string()),
             size,
         });
+    }
+
+    fn docker_archive_member_path(archive_dir: &Path, member: &str) -> anyhow::Result<PathBuf> {
+        let Some(relative) = safe_relative_path(Path::new(member)) else {
+            bail!("unsafe Docker archive member path {member}")
+        };
+        let path = archive_dir.join(relative);
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("canonicalizing Docker archive member {member}"))?;
+        let archive_dir = fs::canonicalize(archive_dir).with_context(|| {
+            format!("canonicalizing archive directory {}", archive_dir.display())
+        })?;
+        if !canonical.starts_with(&archive_dir) {
+            bail!("Docker archive member {member} escapes the unpacked archive directory")
+        }
+        Ok(canonical)
     }
 
     Ok(ImageScanMetadata {
@@ -183,10 +210,26 @@ fn reconstruct_oci_archive(
 }
 
 fn unpack_tar(path: &Path, destination: &Path, apply_whiteouts: bool) -> anyhow::Result<()> {
+    unpack_tar_with_limits(path, destination, apply_whiteouts, DEFAULT_TAR_LIMITS)
+}
+
+fn unpack_tar_with_limits(
+    path: &Path,
+    destination: &Path,
+    apply_whiteouts: bool,
+    limits: TarLimits,
+) -> anyhow::Result<()> {
     let reader = archive_reader(path)?;
     let mut archive = tar::Archive::new(reader);
+    let mut entries_seen = 0_u64;
+    let mut unpacked_bytes = 0_u64;
     for entry in archive.entries()? {
         let mut entry = entry?;
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > limits.max_entries {
+            bail!("tar archive exceeded entry limit of {}", limits.max_entries);
+        }
+
         let entry_path = entry.path()?.into_owned();
         let Some(relative) = safe_relative_path(&entry_path) else {
             continue;
@@ -196,14 +239,26 @@ fn unpack_tar(path: &Path, destination: &Path, apply_whiteouts: bool) -> anyhow:
             continue;
         }
 
-        let target = destination.join(relative);
+        let header_type = entry.header().entry_type();
+        if header_type.is_symlink() || header_type.is_hard_link() {
+            continue; // Skip symlinks and hardlinks to prevent relative path breakouts
+        }
+        if !header_type.is_file() && !header_type.is_dir() {
+            bail!("unsupported tar entry type at {}", relative.display());
+        }
+
+        let target = destination.join(&relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let header_type = entry.header().entry_type();
-        if header_type.is_symlink() || header_type.is_hard_link() {
-            continue; // Skip symlinks and hardlinks to prevent relative path breakouts
+        let entry_size = entry.header().size()?;
+        unpacked_bytes = unpacked_bytes.saturating_add(entry_size);
+        if unpacked_bytes > limits.max_unpacked_bytes {
+            bail!(
+                "tar archive exceeded unpacked byte limit of {}",
+                limits.max_unpacked_bytes
+            );
         }
 
         entry.unpack(&target)?;
@@ -229,7 +284,15 @@ fn apply_whiteout(rootfs: &Path, relative: &Path) -> anyhow::Result<bool> {
     }
 
     if let Some(target_name) = file_name.strip_prefix(".wh.") {
-        remove_path(&rootfs.join(parent).join(target_name))?;
+        let target_relative = Path::new(target_name);
+        if !matches!(
+            target_relative.components().next(),
+            Some(Component::Normal(_))
+        ) || target_relative.components().nth(1).is_some()
+        {
+            bail!("unsafe whiteout target {target_name}");
+        }
+        remove_path(&rootfs.join(parent).join(target_relative))?;
         return Ok(true);
     }
 
@@ -352,5 +415,81 @@ mod tests {
 
         let error = blob_path(temp.path(), &digest).unwrap_err().to_string();
         assert!(error.contains("OCI blob digest mismatch"));
+    }
+
+    #[test]
+    fn docker_archive_rejects_manifest_path_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_dir = temp.path().join("image");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(image_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(
+            image_dir.join("manifest.json"),
+            r#"[{"Config":"config.json","RepoTags":["service:test"],"Layers":["../layer.tar"]}]"#,
+        )
+        .unwrap();
+        let image_archive = temp.path().join("image.tar");
+        {
+            let file = std::fs::File::create(&image_archive).unwrap();
+            let mut archive = tar::Builder::new(file);
+            archive
+                .append_path_with_name(image_dir.join("config.json"), "config.json")
+                .unwrap();
+            archive
+                .append_path_with_name(image_dir.join("manifest.json"), "manifest.json")
+                .unwrap();
+            archive.finish().unwrap();
+        }
+
+        let error = match unpack_image_archive(&image_archive) {
+            Ok(_) => panic!("expected Docker archive path escape to be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unsafe Docker archive member path"));
+    }
+
+    #[test]
+    fn unpack_tar_rejects_archives_over_byte_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let tar_path = temp.path().join("oversized.tar");
+        {
+            let file = std::fs::File::create(&tar_path).unwrap();
+            let mut archive = tar::Builder::new(file);
+            let bytes = b"too-large";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("payload.txt").unwrap();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive.append(&header, &bytes[..]).unwrap();
+            archive.finish().unwrap();
+        }
+
+        let error = unpack_tar_with_limits(
+            &tar_path,
+            &temp.path().join("out"),
+            false,
+            TarLimits {
+                max_entries: 10,
+                max_unpacked_bytes: 4,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unpacked byte limit"));
+    }
+
+    #[test]
+    fn whiteout_rejects_parent_directory_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("dir")).unwrap();
+        std::fs::write(rootfs.join("keep.txt"), b"keep").unwrap();
+
+        let error = apply_whiteout(&rootfs, Path::new("dir/.wh..."))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsafe whiteout target"));
+        assert!(rootfs.join("keep.txt").exists());
     }
 }

@@ -1,7 +1,11 @@
-use std::path::{Component, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Component, Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
+use anyhow::Context;
 use axum::{
+    body::Body,
     extract::{Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
@@ -9,8 +13,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use futures_util::stream;
 use serde_json::json;
-use tokio::fs;
+use sha2::{Digest, Sha256};
+use tokio::{
+    fs,
+    io::{AsyncRead, AsyncReadExt},
+};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -33,6 +42,11 @@ use crate::{
     store::Store,
 };
 
+const BUILD_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const BUILD_TIMEOUT_SECONDS: u64 = 15 * 60;
+const MAX_LAYER_ARTIFACT_BYTES: u64 = 1_073_741_824;
+const OCI_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
@@ -54,7 +68,7 @@ pub fn router_with_auth(store: Store, work_dir: PathBuf, auth_token: Option<Stri
     let auth_token = auth_token.filter(|token| !token.trim().is_empty());
     if auth_token.is_none() {
         tracing::warn!(
-            "fulcr_TOKEN is not set; mutating endpoints will reject requests until a bearer token is configured."
+            "fulcr_TOKEN is not set; protected endpoints will reject requests until a bearer token is configured."
         );
     }
     let state = AppState {
@@ -103,23 +117,14 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
     let method = request.method();
     let path = request.uri().path();
 
-    // Read-only and health endpoints remain open; mutating endpoints require a configured token.
-    let needs_auth =
-        matches!(
-            method,
-            &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
-        ) || path.starts_with("/v1/recipes") && path.ends_with("/vex") && method == Method::POST;
+    let needs_auth = request_needs_auth(method, path);
 
     if !needs_auth {
         return next.run(request).await;
     }
 
     let Some(expected) = state.auth_token.as_ref() else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "fulcr_TOKEN is required for mutating endpoints" })),
-        )
-            .into_response();
+        return unauthorized_response("fulcr_TOKEN is required for protected endpoints");
     };
 
     let presented = request
@@ -133,12 +138,33 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
         Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
             next.run(request).await
         }
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing or invalid bearer token" })),
-        )
-            .into_response(),
+        _ => unauthorized_response("missing or invalid bearer token"),
     }
+}
+
+fn unauthorized_response(message: impl Into<String>) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(r#"Bearer realm="fulcr""#),
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        headers,
+        Json(json!({ "error": message.into() })),
+    )
+        .into_response()
+}
+
+fn request_needs_auth(method: &Method, path: &str) -> bool {
+    let mutating = matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    );
+    let oci_content = path.starts_with("/v2/") && path != "/v2/";
+    let metadata_api = path.starts_with("/v1/");
+
+    mutating || oci_content || metadata_api
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -165,8 +191,58 @@ async fn oci_health() -> Response {
     (StatusCode::OK, headers).into_response()
 }
 
-async fn oci_referrers_stub() -> Response {
-    use oci_spec::image::{ImageIndexBuilder, MediaType};
+async fn oci_referrers_response(
+    name: String,
+    digest: String,
+    state: AppState,
+    include_body: bool,
+) -> AppResult<Response> {
+    use oci_spec::image::{DescriptorBuilder, ImageIndexBuilder, MediaType};
+
+    let mut recipe_with_subject = None;
+    for candidate in state.store.list_recipes().await? {
+        if candidate.name != name {
+            continue;
+        }
+        if candidate.digest == digest {
+            let subject = MetadataSubject::recipe(&candidate);
+            recipe_with_subject = Some((candidate, subject));
+            break;
+        }
+        if let Ok(manifest) = materialized_image_manifest(&state, &candidate).await {
+            if manifest.digest == digest {
+                let subject = MetadataSubject::image(&manifest);
+                recipe_with_subject = Some((candidate, subject));
+                break;
+            }
+        }
+    }
+    let Some((recipe, subject)) = recipe_with_subject else {
+        return Err(AppError::not_found(format!(
+            "referrers for {name}@{digest} not found"
+        )));
+    };
+    let documents = metadata_documents(&state, &recipe, &subject).await?;
+    let mut descriptors = Vec::new();
+    for document in documents {
+        let annotations = std::collections::HashMap::from([
+            (
+                "org.opencontainers.image.title".to_string(),
+                document.title.to_string(),
+            ),
+            ("dev.fulcr.endpoint".to_string(), document.endpoint.clone()),
+        ]);
+        descriptors.push(
+            DescriptorBuilder::default()
+                .media_type(MediaType::ArtifactManifest)
+                .artifact_type(MediaType::Other(document.artifact_type.to_string()))
+                .digest(parse_oci_digest(&document.manifest_digest)?)
+                .size(document.manifest_bytes.len() as u64)
+                .annotations(annotations)
+                .build()
+                .map_err(|error| AppError::Internal(error.into()))?,
+        );
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -177,11 +253,17 @@ async fn oci_referrers_stub() -> Response {
     let index = ImageIndexBuilder::default()
         .schema_version(2u32)
         .media_type(MediaType::ImageIndex)
-        .manifests(vec![])
+        .manifests(descriptors)
         .build()
-        .unwrap();
+        .map_err(|error| AppError::Internal(error.into()))?;
 
-    (headers, Json(index)).into_response()
+    let bytes = serde_json::to_vec(&index)?;
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+    if include_body {
+        Ok((headers, bytes).into_response())
+    } else {
+        Ok((StatusCode::OK, headers).into_response())
+    }
 }
 
 async fn oci_distribution(
@@ -207,15 +289,19 @@ async fn oci_distribution_response(
         OciRoute::Manifest { name, reference } => {
             oci_manifest_response(name, reference, state, include_body).await
         }
-        OciRoute::Blob { digest } => oci_blob_response(digest, state, include_body).await,
-        OciRoute::Referrers => Ok(oci_referrers_stub().await),
+        OciRoute::Blob { name, digest } => {
+            oci_blob_response(name, digest, state, include_body).await
+        }
+        OciRoute::Referrers { name, digest } => {
+            oci_referrers_response(name, digest, state, include_body).await
+        }
     }
 }
 
 enum OciRoute {
     Manifest { name: String, reference: String },
-    Blob { digest: String },
-    Referrers,
+    Blob { name: String, digest: String },
+    Referrers { name: String, digest: String },
 }
 
 fn parse_oci_route(path: &str) -> AppResult<OciRoute> {
@@ -239,8 +325,14 @@ fn parse_oci_route(path: &str) -> AppResult<OciRoute> {
             name,
             reference: value,
         }),
-        "blobs" => Ok(OciRoute::Blob { digest: value }),
-        "referrers" => Ok(OciRoute::Referrers),
+        "blobs" => Ok(OciRoute::Blob {
+            name,
+            digest: value,
+        }),
+        "referrers" => Ok(OciRoute::Referrers {
+            name,
+            digest: value,
+        }),
         _ => Err(AppError::not_found(format!("OCI route {path} not found"))),
     }
 }
@@ -263,9 +355,753 @@ mod tests {
     #[test]
     fn parses_multi_segment_oci_blob_route() {
         match parse_oci_route("team/platform/service/blobs/sha256:abc").unwrap() {
-            OciRoute::Blob { digest } => assert_eq!(digest, "sha256:abc"),
+            OciRoute::Blob { name, digest } => {
+                assert_eq!(name, "team/platform/service");
+                assert_eq!(digest, "sha256:abc");
+            }
             _ => panic!("expected blob route"),
         }
+    }
+
+    #[test]
+    fn parses_multi_segment_oci_referrers_route() {
+        match parse_oci_route("team/platform/service/referrers/sha256:abc").unwrap() {
+            OciRoute::Referrers { name, digest } => {
+                assert_eq!(name, "team/platform/service");
+                assert_eq!(digest, "sha256:abc");
+            }
+            _ => panic!("expected referrers route"),
+        }
+    }
+
+    #[test]
+    fn auth_required_for_mutations_and_oci_content_not_health() {
+        assert!(request_needs_auth(&Method::POST, "/v1/recipes"));
+        assert!(request_needs_auth(
+            &Method::GET,
+            "/v2/service/manifests/latest"
+        ));
+        assert!(request_needs_auth(
+            &Method::HEAD,
+            "/v2/service/blobs/sha256:abc"
+        ));
+        assert!(request_needs_auth(&Method::GET, "/v1/recipes"));
+        assert!(!request_needs_auth(&Method::GET, "/v2/"));
+        assert!(!request_needs_auth(&Method::GET, "/healthz"));
+    }
+
+    #[test]
+    fn unauthorized_response_advertises_bearer_auth() {
+        let response = unauthorized_response("missing token");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            r#"Bearer realm="fulcr""#
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_route_denies_cached_layer_when_gate_denies() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+
+        let bytes = fixture_layer_bytes();
+        let digest = digest_bytes(&bytes);
+        let cache_path = store.cache_dir().join(cache_file_name(&digest));
+        tokio::fs::write(&cache_path, &bytes).await.unwrap();
+        store
+            .save_build(&BuildRecord {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                status: BuildStatus::Succeeded,
+                created_at: timestamp(),
+                started_at: Some(timestamp()),
+                finished_at: Some(timestamp()),
+                command: Vec::new(),
+                working_dir: None,
+                exit_code: Some(0),
+                artifact: Some(ArtifactRef {
+                    digest: digest.clone(),
+                    diff_id: Some(digest.clone()),
+                    media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                    size: bytes.len() as u64,
+                    retained: true,
+                    path: Some(cache_path),
+                    expires_at: None,
+                }),
+                stdout_tail: None,
+                stderr_tail: None,
+                security_anomalies: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let state = AppState {
+            store,
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+
+        match oci_blob_response("service".to_string(), digest, state, true).await {
+            Err(AppError::Forbidden(message)) => {
+                assert!(message.contains("metadata gate denied pull"));
+            }
+            other => panic!("expected forbidden blob response, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_native_caps_stdout() {
+        let command = format!("printf '%*s' {} ''", BUILD_OUTPUT_LIMIT_BYTES + 1024);
+        let (exit_code, stdout, stderr, anomalies) = execute_native(
+            vec!["/bin/sh".to_string(), "-c".to_string(), command],
+            Vec::new(),
+            ".",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout.len(), BUILD_OUTPUT_LIMIT_BYTES);
+        assert!(String::from_utf8_lossy(&stderr).contains("stdout exceeded output capture limit"));
+        assert!(anomalies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_artifact_ref_rejects_non_tar_layer_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        tokio::fs::write(work_dir.join("artifact.bin"), b"not a tar layer")
+            .await
+            .unwrap();
+        let store = Store::open(temp.path().join("store")).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(work_dir.clone()),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                artifact: Some(PathBuf::from("artifact.bin")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        let state = AppState {
+            store,
+            work_dir: work_dir.clone(),
+            auth_token: None,
+        };
+        let mut status = BuildStatus::Succeeded;
+        let mut notes = Vec::new();
+
+        let artifact = read_artifact_ref(
+            &state,
+            &recipe,
+            &BuildRequest::default(),
+            &work_dir,
+            &mut status,
+            &mut notes,
+        )
+        .await
+        .unwrap();
+
+        assert!(artifact.is_none());
+        assert!(matches!(status, BuildStatus::Failed));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("not a valid uncompressed OCI layer tar")));
+    }
+
+    #[tokio::test]
+    async fn validate_oci_layer_tar_file_rejects_parent_path_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = temp.path().join("layer.tar");
+        {
+            let file = std::fs::File::create(&layer).unwrap();
+            let mut archive = tar::Builder::new(file);
+            let payload = b"escape";
+            let mut header = tar::Header::new_gnu();
+            let unsafe_path = b"../escape.txt";
+            header.as_mut_bytes()[..unsafe_path.len()].copy_from_slice(unsafe_path);
+            header.set_size(payload.len() as u64);
+            header.set_cksum();
+            archive.append(&header, &payload[..]).unwrap();
+            archive.finish().unwrap();
+        }
+        let size = std::fs::metadata(&layer).unwrap().len();
+
+        let error = validate_oci_layer_tar_file(&layer, size)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsafe layer tar entry path"));
+    }
+
+    #[tokio::test]
+    async fn validate_oci_layer_tar_file_rejects_unsafe_hard_link_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = temp.path().join("layer.tar");
+        {
+            let file = std::fs::File::create(&layer).unwrap();
+            let mut archive = tar::Builder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_path("safe-link").unwrap();
+            header.set_link_name("../escape.txt").unwrap();
+            header.set_size(0);
+            header.set_cksum();
+            archive.append(&header, std::io::empty()).unwrap();
+            archive.finish().unwrap();
+        }
+        let size = std::fs::metadata(&layer).unwrap().len();
+
+        let error = validate_oci_layer_tar_file(&layer, size)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsafe layer tar hard link target"));
+    }
+
+    #[test]
+    fn uncompressed_layer_diff_id_must_match_blob_digest() {
+        let artifact = ArtifactRef {
+            digest: format!("sha256:{}", "1".repeat(64)),
+            diff_id: Some(format!("sha256:{}", "2".repeat(64))),
+            media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+            size: 0,
+            retained: true,
+            path: None,
+            expires_at: None,
+        };
+
+        let error = match validated_layer_diff_id(&artifact) {
+            Ok(_) => panic!("expected mismatched diff_id to be rejected"),
+            Err(AppError::Forbidden(message)) => message,
+            Err(other) => panic!("expected forbidden error, got {other:?}"),
+        };
+
+        assert!(error.contains("does not match blob digest"));
+    }
+
+    #[tokio::test]
+    async fn metadata_documents_are_served_by_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+        let state = AppState {
+            store,
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+        let referrers_response = oci_referrers_response(
+            "service".to_string(),
+            recipe.digest.clone(),
+            state.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(referrers_response.status(), StatusCode::OK);
+
+        let head_response = oci_referrers_response(
+            "service".to_string(),
+            recipe.digest.clone(),
+            state.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(head_response.status(), StatusCode::OK);
+
+        let recipe_subject = MetadataSubject::recipe(&recipe);
+        let document = metadata_documents(&state, &recipe, &recipe_subject)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|document| document.title == "sbom")
+            .unwrap();
+
+        let manifest_response = oci_manifest_response(
+            "service".to_string(),
+            document.manifest_digest.clone(),
+            state.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest_response.status(), StatusCode::OK);
+
+        let response =
+            oci_blob_response("service".to_string(), document.digest.clone(), state, true)
+                .await
+                .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn referrers_are_available_for_image_manifest_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+
+        let bytes = fixture_layer_bytes();
+        let digest = digest_bytes(&bytes);
+        let cache_path = store.cache_dir().join(cache_file_name(&digest));
+        tokio::fs::write(&cache_path, &bytes).await.unwrap();
+        store
+            .save_build(&BuildRecord {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                status: BuildStatus::Succeeded,
+                created_at: timestamp(),
+                started_at: Some(timestamp()),
+                finished_at: Some(timestamp()),
+                command: Vec::new(),
+                working_dir: None,
+                exit_code: Some(0),
+                artifact: Some(ArtifactRef {
+                    digest: digest.clone(),
+                    diff_id: Some(digest.clone()),
+                    media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                    size: bytes.len() as u64,
+                    retained: true,
+                    path: Some(cache_path),
+                    expires_at: None,
+                }),
+                stdout_tail: None,
+                stderr_tail: None,
+                security_anomalies: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .save_scan(&ScanReport {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                created_at: timestamp(),
+                scanner: "test".to_string(),
+                mode: crate::models::ScanMode::Source,
+                root: temp.path().to_path_buf(),
+                image: None,
+                status: crate::models::ScanStatus::Completed,
+                summary: crate::models::ScanSummary::default(),
+                components: Vec::new(),
+                crypto: Vec::new(),
+                binaries: Vec::new(),
+                findings: Vec::new(),
+                vex_candidates: Vec::new(),
+                sbom: crate::metadata::sbom_document(&recipe),
+                cbom: crate::metadata::cbom_document(&recipe),
+            })
+            .await
+            .unwrap();
+
+        let state = AppState {
+            store,
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+        let manifest_response = oci_manifest_response(
+            "service".to_string(),
+            recipe.digest.clone(),
+            state.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        let image_digest = manifest_response
+            .headers()
+            .get("Docker-Content-Digest")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let referrers_response = oci_referrers_response(
+            "service".to_string(),
+            image_digest.clone(),
+            state.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(referrers_response.status(), StatusCode::OK);
+
+        let image_manifest = materialized_image_manifest(&state, &recipe).await.unwrap();
+        assert_eq!(image_manifest.digest, image_digest);
+        let image_subject = MetadataSubject::image(&image_manifest);
+        let document = metadata_documents(&state, &recipe, &image_subject)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|document| document.title == "sbom")
+            .unwrap();
+        let artifact_manifest: serde_json::Value =
+            serde_json::from_slice(&document.manifest_bytes).unwrap();
+        assert_eq!(
+            artifact_manifest["subject"]["mediaType"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(artifact_manifest["subject"]["digest"], image_digest);
+        assert_eq!(
+            artifact_manifest["subject"]["size"].as_u64(),
+            Some(image_manifest.bytes.len() as u64)
+        );
+        let artifact_manifest_response =
+            oci_manifest_response("service".to_string(), document.manifest_digest, state, true)
+                .await
+                .unwrap();
+        assert_eq!(artifact_manifest_response.status(), StatusCode::OK);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_manifest_requires_existing_retained_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let layer_bytes = fixture_layer_bytes();
+        tokio::fs::write(work_dir.join("layer.tar"), &layer_bytes)
+            .await
+            .unwrap();
+        let store = Store::open(temp.path().join("store")).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(work_dir.clone()),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                command: vec!["/bin/sh".to_string(), "-c".to_string(), ":".to_string()],
+                artifact: Some(PathBuf::from("layer.tar")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+        store
+            .save_scan(&ScanReport {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                created_at: timestamp(),
+                scanner: "test".to_string(),
+                mode: crate::models::ScanMode::Source,
+                root: work_dir.clone(),
+                image: None,
+                status: crate::models::ScanStatus::Completed,
+                summary: crate::models::ScanSummary::default(),
+                components: Vec::new(),
+                crypto: Vec::new(),
+                binaries: Vec::new(),
+                findings: Vec::new(),
+                vex_candidates: Vec::new(),
+                sbom: crate::metadata::sbom_document(&recipe),
+                cbom: crate::metadata::cbom_document(&recipe),
+            })
+            .await
+            .unwrap();
+
+        let state = AppState {
+            store,
+            work_dir,
+            auth_token: None,
+        };
+        match oci_manifest_response(
+            "service".to_string(),
+            recipe.digest.clone(),
+            state.clone(),
+            false,
+        )
+        .await
+        {
+            Err(AppError::Forbidden(message)) => {
+                assert!(message.contains("no successful retained build artifact"));
+            }
+            other => panic!("expected forbidden manifest response, got {other:?}"),
+        }
+
+        let builds = state.store.list_builds(recipe.id).await.unwrap();
+        assert!(builds.is_empty());
+        assert!(!state
+            .store
+            .cache_dir()
+            .join(cache_file_name(&digest_bytes(&layer_bytes)))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn planned_build_does_not_shadow_retained_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+
+        let bytes = fixture_layer_bytes();
+        let digest = digest_bytes(&bytes);
+        let cache_path = store.cache_dir().join(cache_file_name(&digest));
+        tokio::fs::write(&cache_path, &bytes).await.unwrap();
+        store
+            .save_build(&BuildRecord {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                status: BuildStatus::Succeeded,
+                created_at: timestamp(),
+                started_at: Some(timestamp()),
+                finished_at: Some(timestamp()),
+                command: Vec::new(),
+                working_dir: None,
+                exit_code: Some(0),
+                artifact: Some(ArtifactRef {
+                    digest: digest.clone(),
+                    diff_id: Some(digest.clone()),
+                    media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                    size: bytes.len() as u64,
+                    retained: true,
+                    path: Some(cache_path),
+                    expires_at: None,
+                }),
+                stdout_tail: None,
+                stderr_tail: None,
+                security_anomalies: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .save_build(&BuildRecord::planned(&recipe))
+            .await
+            .unwrap();
+        store
+            .save_scan(&ScanReport {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                created_at: timestamp(),
+                scanner: "test".to_string(),
+                mode: crate::models::ScanMode::Source,
+                root: temp.path().to_path_buf(),
+                image: None,
+                status: crate::models::ScanStatus::Completed,
+                summary: crate::models::ScanSummary::default(),
+                components: Vec::new(),
+                crypto: Vec::new(),
+                binaries: Vec::new(),
+                findings: Vec::new(),
+                vex_candidates: Vec::new(),
+                sbom: crate::metadata::sbom_document(&recipe),
+                cbom: crate::metadata::cbom_document(&recipe),
+            })
+            .await
+            .unwrap();
+
+        let state = AppState {
+            store,
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+        let manifest_response = oci_manifest_response(
+            "service".to_string(),
+            recipe.digest.clone(),
+            state.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest_response.status(), StatusCode::OK);
+
+        let decision = metadata_gate(&state, &recipe).await.unwrap();
+        assert_eq!(decision.outcome, GateOutcome::Allowed);
+    }
+
+    #[tokio::test]
+    async fn layer_artifact_size_rejects_oversized_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized-layer.tar");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_LAYER_ARTIFACT_BYTES + 512).unwrap();
+
+        let error = layer_artifact_size(&path).await.unwrap_err().to_string();
+
+        assert!(error.contains("exceeding limit"));
+    }
+
+    #[test]
+    fn resolve_working_dir_anchors_relative_source_path_under_work_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(work_dir.join("checkout/service")).unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(PathBuf::from("checkout")),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                working_dir: Some(PathBuf::from("service")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+
+        let resolved = resolve_working_dir(&recipe, &work_dir).unwrap();
+
+        assert_eq!(resolved, work_dir.join("checkout/service"));
+    }
+
+    fn fixture_layer_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut bytes);
+            let payload = b"hello";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("hello.txt").unwrap();
+            header.set_size(payload.len() as u64);
+            header.set_cksum();
+            archive.append(&header, &payload[..]).unwrap();
+            archive.finish().unwrap();
+        }
+        bytes
     }
 }
 
@@ -390,7 +1226,7 @@ async fn get_gate(
     let vex = state.store.list_vex(id).await?;
     Ok(Json(gate::evaluate_gate(
         &recipe,
-        builds.last(),
+        latest_build_evidence(&builds),
         latest_scan.as_ref(),
         &vex,
     )))
@@ -419,7 +1255,6 @@ async fn add_vex(
             ));
         }
     }
-
     let statement = VexStatement::new(id, recipe.digest.clone(), input);
     state.store.save_vex_statement(&statement).await?;
     Ok((StatusCode::CREATED, Json(statement)))
@@ -449,7 +1284,11 @@ async fn get_attestation(
     let recipe = load_recipe(&state, id).await?;
     let builds = state.store.list_builds(id).await?;
     let vex = state.store.list_vex(id).await?;
-    Ok(Json(attestation_document(&recipe, builds.last(), &vex)?))
+    Ok(Json(attestation_document(
+        &recipe,
+        latest_build_evidence(&builds),
+        &vex,
+    )?))
 }
 
 async fn get_slsa(
@@ -462,7 +1301,7 @@ async fn get_slsa(
     let vex = state.store.list_vex(id).await?;
     Ok(Json(slsa_provenance_document(
         &recipe,
-        builds.last(),
+        latest_build_evidence(&builds),
         latest_scan.as_ref(),
         &vex,
     )?))
@@ -474,6 +1313,27 @@ async fn oci_manifest_response(
     state: AppState,
     include_body: bool,
 ) -> AppResult<Response> {
+    if let Some(document) = metadata_artifact_manifest_by_digest(&state, &name, &reference).await? {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.oci.artifact.manifest.v1+json"),
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from(document.manifest_bytes.len()),
+        );
+        headers.insert(
+            "Docker-Content-Digest",
+            header_value(&document.manifest_digest)?,
+        );
+        return if include_body {
+            Ok((headers, document.manifest_bytes).into_response())
+        } else {
+            Ok((StatusCode::OK, headers).into_response())
+        };
+    }
+
     let recipe = if let Ok(id) = Uuid::parse_str(&reference) {
         state.store.get_recipe(id).await?.filter(|r| r.name == name)
     } else {
@@ -483,69 +1343,7 @@ async fn oci_manifest_response(
     let recipe = recipe
         .ok_or_else(|| AppError::not_found(format!("manifest {name}:{reference} not found")))?;
 
-    enforce_manifest_gate(&state, &recipe).await?;
-
-    let layer = latest_materialized_layer(&state, &recipe).await?;
-    let diff_ids = vec![layer.digest.clone()];
-    let config = oci_image_config_bytes_for_layers(&recipe, &diff_ids)?;
-    let config_digest = crate::digest::digest_bytes(&config);
-
-    use oci_spec::image::{DescriptorBuilder, ImageManifestBuilder, MediaType};
-
-    let annotations = std::collections::HashMap::from([
-        (
-            "org.opencontainers.image.source".to_string(),
-            recipe.source.repo.clone(),
-        ),
-        (
-            "org.opencontainers.image.revision".to_string(),
-            recipe.source.revision.clone(),
-        ),
-        ("dev.fulcr.materialized".to_string(), "false".to_string()),
-        (
-            "dev.fulcr.retention".to_string(),
-            if recipe.policy.retain_artifact {
-                "selective".to_string()
-            } else {
-                "ephemeral".to_string()
-            },
-        ),
-        (
-            "dev.fulcr.note".to_string(),
-            "metadata-only manifest; artifact is constructed ad hoc".to_string(),
-        ),
-    ]);
-
-    let config_desc = DescriptorBuilder::default()
-        .media_type(MediaType::ImageConfig)
-        .digest(
-            config_digest
-                .clone()
-                .parse::<oci_spec::image::Digest>()
-                .unwrap(),
-        )
-        .size(config.len() as u64)
-        .build()
-        .unwrap();
-
-    let layer_desc = DescriptorBuilder::default()
-        .media_type(MediaType::ImageLayer)
-        .digest(layer.digest.parse::<oci_spec::image::Digest>().unwrap())
-        .size(layer.size)
-        .build()
-        .unwrap();
-
-    let manifest = ImageManifestBuilder::default()
-        .schema_version(2u32)
-        .media_type(MediaType::ImageManifest)
-        .config(config_desc)
-        .layers(vec![layer_desc])
-        .annotations(annotations)
-        .build()
-        .unwrap();
-
-    let manifest_bytes = serde_json::to_vec(&manifest)?;
-    let manifest_digest = crate::digest::digest_bytes(&manifest_bytes);
+    let manifest = materialized_image_manifest(&state, &recipe).await?;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -554,21 +1352,75 @@ async fn oci_manifest_response(
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from(manifest_bytes.len()),
+        HeaderValue::from(manifest.bytes.len()),
     );
-    headers.insert(
-        "Docker-Content-Digest",
-        HeaderValue::from_str(&manifest_digest).unwrap(),
-    );
+    headers.insert("Docker-Content-Digest", header_value(&manifest.digest)?);
 
     if include_body {
-        Ok((headers, manifest_bytes).into_response())
+        Ok((headers, manifest.bytes).into_response())
     } else {
         Ok((StatusCode::OK, headers).into_response())
     }
 }
 
+struct MaterializedImageManifest {
+    digest: String,
+    bytes: Vec<u8>,
+}
+
+async fn materialized_image_manifest(
+    state: &AppState,
+    recipe: &Recipe,
+) -> AppResult<MaterializedImageManifest> {
+    enforce_manifest_gate(state, recipe).await?;
+
+    let layer = latest_materialized_layer(state, recipe).await?;
+    materialized_image_manifest_for_layer(recipe, &layer)
+}
+
+fn materialized_image_manifest_for_layer(
+    recipe: &Recipe,
+    layer: &ArtifactRef,
+) -> AppResult<MaterializedImageManifest> {
+    let diff_ids = vec![validated_layer_diff_id(layer)?];
+    let config = oci_image_config_bytes_for_layers(recipe, &diff_ids)?;
+    let config_digest = digest_bytes(&config);
+
+    parse_oci_digest(&config_digest)?;
+    parse_oci_digest(&layer.digest)?;
+    let retention = if recipe.policy.retain_artifact {
+        "selective"
+    } else {
+        "ephemeral"
+    };
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config.len() as u64
+        },
+        "layers": [{
+            "mediaType": OCI_LAYER_MEDIA_TYPE,
+            "digest": layer.digest,
+            "size": layer.size
+        }],
+        "annotations": {
+            "org.opencontainers.image.source": recipe.source.repo.clone(),
+            "org.opencontainers.image.revision": recipe.source.revision.clone(),
+            "dev.fulcr.materialized": "true",
+            "dev.fulcr.retention": retention,
+            "dev.fulcr.note": "approved retained layer artifact; source and metadata remain the registry source of truth"
+        }
+    });
+    let bytes = serde_json::to_vec(&manifest)?;
+    let digest = digest_bytes(&bytes);
+    Ok(MaterializedImageManifest { digest, bytes })
+}
+
 async fn oci_blob_response(
+    name: String,
     digest: String,
     state: AppState,
     include_body: bool,
@@ -577,17 +1429,15 @@ async fn oci_blob_response(
         if let Some(recipe) = state.store.get_recipe(recipe_id).await? {
             let config = oci_image_config_bytes(&recipe)?;
             // Re-verify the digest to defend against index drift.
-            if crate::digest::digest_bytes(&config) == digest {
+            if recipe.name == name && crate::digest::digest_bytes(&config) == digest {
+                enforce_manifest_gate(&state, &recipe).await?;
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/vnd.oci.image.config.v1+json"),
                 );
                 headers.insert(header::CONTENT_LENGTH, HeaderValue::from(config.len()));
-                headers.insert(
-                    "Docker-Content-Digest",
-                    HeaderValue::from_str(&digest).unwrap(),
-                );
+                headers.insert("Docker-Content-Digest", header_value(&digest)?);
                 return if include_body {
                     Ok((headers, config).into_response())
                 } else {
@@ -598,60 +1448,263 @@ async fn oci_blob_response(
     }
 
     for recipe in state.store.list_recipes().await? {
+        if recipe.name != name {
+            continue;
+        }
         if let Ok(layer) = latest_materialized_layer(&state, &recipe).await {
-            let diff_ids = vec![layer.digest.clone()];
+            let diff_ids = vec![validated_layer_diff_id(&layer)?];
             let config = oci_image_config_bytes_for_layers(&recipe, &diff_ids)?;
             if crate::digest::digest_bytes(&config) == digest {
+                enforce_manifest_gate(&state, &recipe).await?;
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/vnd.oci.image.config.v1+json"),
                 );
                 headers.insert(header::CONTENT_LENGTH, HeaderValue::from(config.len()));
-                headers.insert(
-                    "Docker-Content-Digest",
-                    HeaderValue::from_str(&digest).unwrap(),
-                );
+                headers.insert("Docker-Content-Digest", header_value(&digest)?);
                 return if include_body {
                     Ok((headers, config).into_response())
                 } else {
                     Ok((StatusCode::OK, headers).into_response())
                 };
             }
-        }
-    }
 
-    let cache_path = state
-        .store
-        .cache_dir()
-        .join(crate::digest::cache_file_name(&digest));
-    if let Ok(bytes) = fs::read(&cache_path).await {
-        if crate::digest::digest_bytes(&bytes) != digest {
-            // Defense in depth: refuse to serve a cached blob whose digest no longer matches.
-            return Err(AppError::not_found(format!("blob {digest} not found")));
+            if layer.digest == digest {
+                enforce_manifest_gate(&state, &recipe).await?;
+                let Some(path) = layer.path.as_ref() else {
+                    return Err(AppError::not_found(format!("blob {digest} not found")));
+                };
+                let size = validate_layer_artifact_file(path, &layer.digest, layer.size)
+                    .await
+                    .map_err(|_| AppError::not_found(format!("blob {digest} not found")))?;
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+                headers.insert("Docker-Content-Digest", header_value(&digest)?);
+                return if include_body {
+                    let file = fs::File::open(path)
+                        .await
+                        .map_err(|_| AppError::not_found(format!("blob {digest} not found")))?;
+                    Ok((headers, file_body(file)).into_response())
+                } else {
+                    Ok((StatusCode::OK, headers).into_response())
+                };
+            }
         }
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-        headers.insert(
-            "Docker-Content-Digest",
-            HeaderValue::from_str(&digest).unwrap(),
-        );
-        return if include_body {
-            Ok((headers, bytes).into_response())
-        } else {
-            Ok((StatusCode::OK, headers).into_response())
-        };
+
+        if let Some(document) = metadata_document_by_digest(&state, &recipe, &digest).await? {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, header_value(document.artifact_type)?);
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from(document.bytes.len()),
+            );
+            headers.insert("Docker-Content-Digest", header_value(&document.digest)?);
+            return if include_body {
+                Ok((headers, document.bytes).into_response())
+            } else {
+                Ok((StatusCode::OK, headers).into_response())
+            };
+        }
     }
 
     Err(AppError::not_found(format!("blob {digest} not found")))
 }
 
+struct MetadataDocument {
+    title: &'static str,
+    artifact_type: &'static str,
+    endpoint: String,
+    digest: String,
+    bytes: Vec<u8>,
+    manifest_digest: String,
+    manifest_bytes: Vec<u8>,
+}
+
+struct MetadataSubject {
+    media_type: &'static str,
+    digest: String,
+    size: u64,
+}
+
+impl MetadataSubject {
+    fn recipe(recipe: &Recipe) -> Self {
+        Self {
+            media_type: "application/vnd.fulcr.recipe.v1+json",
+            digest: recipe.digest.clone(),
+            size: 0,
+        }
+    }
+
+    fn image(manifest: &MaterializedImageManifest) -> Self {
+        Self {
+            media_type: "application/vnd.oci.image.manifest.v1+json",
+            digest: manifest.digest.clone(),
+            size: manifest.bytes.len() as u64,
+        }
+    }
+}
+
+async fn metadata_documents(
+    state: &AppState,
+    recipe: &Recipe,
+    subject: &MetadataSubject,
+) -> AppResult<Vec<MetadataDocument>> {
+    let builds = state.store.list_builds(recipe.id).await?;
+    let latest_scan = state.store.latest_scan(recipe.id).await?;
+    let vex = state.store.list_vex(recipe.id).await?;
+    let sbom = latest_scan
+        .as_ref()
+        .map(|scan| scan.sbom.clone())
+        .unwrap_or_else(|| sbom_document(recipe));
+    let sbom_artifact_type = if sbom.get("spdxVersion").is_some() {
+        "application/spdx+json"
+    } else {
+        "application/vnd.cyclonedx+json"
+    };
+    let cbom = latest_scan
+        .as_ref()
+        .map(|scan| scan.cbom.clone())
+        .unwrap_or_else(|| cbom_document(recipe));
+
+    let values = [
+        (
+            "sbom",
+            sbom_artifact_type,
+            format!("/v1/recipes/{}/sbom", recipe.id),
+            sbom,
+        ),
+        (
+            "cbom",
+            "application/vnd.fulcr.cbom+json",
+            format!("/v1/recipes/{}/cbom", recipe.id),
+            cbom,
+        ),
+        (
+            "openvex",
+            "application/openvex+json",
+            format!("/v1/recipes/{}/openvex", recipe.id),
+            openvex_document(recipe, &vex),
+        ),
+        (
+            "slsa",
+            "application/vnd.in-toto+json",
+            format!("/v1/recipes/{}/slsa", recipe.id),
+            slsa_provenance_document(
+                recipe,
+                latest_build_evidence(&builds),
+                latest_scan.as_ref(),
+                &vex,
+            )?,
+        ),
+        (
+            "attestation",
+            "application/vnd.fulcr.attestation+json",
+            format!("/v1/recipes/{}/attestation", recipe.id),
+            attestation_document(recipe, latest_build_evidence(&builds), &vex)?,
+        ),
+    ];
+
+    let mut documents = Vec::new();
+    for (title, artifact_type, endpoint, value) in values {
+        let bytes = serde_json::to_vec(&value)?;
+        let digest = digest_bytes(&bytes);
+        let manifest = json!({
+            "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
+            "artifactType": artifact_type,
+            "blobs": [{
+                "mediaType": artifact_type,
+                "digest": digest,
+                "size": bytes.len() as u64,
+                "annotations": {
+                    "org.opencontainers.image.title": title
+                }
+            }],
+            "subject": {
+                "mediaType": subject.media_type,
+                "digest": subject.digest,
+                "size": subject.size
+            },
+            "annotations": {
+                "org.opencontainers.image.title": title,
+                "dev.fulcr.endpoint": endpoint.clone()
+            }
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        let manifest_digest = digest_bytes(&manifest_bytes);
+        documents.push(MetadataDocument {
+            title,
+            artifact_type,
+            endpoint,
+            digest,
+            bytes,
+            manifest_digest,
+            manifest_bytes,
+        });
+    }
+    Ok(documents)
+}
+
+async fn metadata_document_by_digest(
+    state: &AppState,
+    recipe: &Recipe,
+    digest: &str,
+) -> AppResult<Option<MetadataDocument>> {
+    Ok(
+        metadata_documents(state, recipe, &MetadataSubject::recipe(recipe))
+            .await?
+            .into_iter()
+            .find(|document| document.digest == digest),
+    )
+}
+
+async fn metadata_artifact_manifest_by_digest(
+    state: &AppState,
+    name: &str,
+    digest: &str,
+) -> AppResult<Option<MetadataDocument>> {
+    for recipe in state.store.list_recipes().await? {
+        if recipe.name != name {
+            continue;
+        }
+        let mut subjects = vec![MetadataSubject::recipe(&recipe)];
+        if let Ok(manifest) = materialized_image_manifest(state, &recipe).await {
+            subjects.push(MetadataSubject::image(&manifest));
+        }
+        for subject in subjects {
+            if let Some(document) = metadata_documents(state, &recipe, &subject)
+                .await?
+                .into_iter()
+                .find(|document| document.manifest_digest == digest)
+            {
+                return Ok(Some(document));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_oci_digest(digest: &str) -> AppResult<oci_spec::image::Digest> {
+    digest
+        .parse::<oci_spec::image::Digest>()
+        .map_err(|error| AppError::Internal(error.into()))
+}
+
+fn header_value(value: &str) -> AppResult<HeaderValue> {
+    HeaderValue::from_str(value).map_err(|error| AppError::Internal(error.into()))
+}
+
 async fn latest_materialized_layer(state: &AppState, recipe: &Recipe) -> AppResult<ArtifactRef> {
-    let Some(build) = state.store.list_builds(recipe.id).await?.pop() else {
+    let builds = state.store.list_builds(recipe.id).await?;
+    let Some(build) = builds
+        .into_iter()
+        .rev()
+        .find(|build| !matches!(build.status, BuildStatus::Planned))
+    else {
         return Err(AppError::forbidden(
             "metadata gate allowed pull, but no successful retained build artifact is available",
         ));
@@ -680,15 +1733,9 @@ async fn latest_materialized_layer(state: &AppState, recipe: &Recipe) -> AppResu
             build.id
         )));
     };
-    let bytes = fs::read(path).await.map_err(|_| {
-        AppError::forbidden(format!(
-            "metadata gate allowed pull, but cached artifact for build {} is unavailable",
-            build.id
-        ))
-    })?;
-    if digest_bytes(&bytes) != artifact.digest {
+    if let Err(error) = validate_layer_artifact_file(path, &artifact.digest, artifact.size).await {
         return Err(AppError::forbidden(format!(
-            "metadata gate allowed pull, but cached artifact for build {} no longer matches its digest",
+            "metadata gate allowed pull, but cached artifact for build {} is invalid: {error}",
             build.id
         )));
     }
@@ -731,10 +1778,17 @@ async fn metadata_gate(state: &AppState, recipe: &Recipe) -> AppResult<GateDecis
     let vex = state.store.list_vex(recipe.id).await?;
     Ok(gate::evaluate_gate(
         recipe,
-        builds.last(),
+        latest_build_evidence(&builds),
         latest_scan.as_ref(),
         &vex,
     ))
+}
+
+fn latest_build_evidence(builds: &[BuildRecord]) -> Option<&BuildRecord> {
+    builds
+        .iter()
+        .rev()
+        .find(|build| !matches!(build.status, BuildStatus::Planned))
 }
 
 async fn execute_native(
@@ -770,18 +1824,54 @@ async fn execute_native(
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn: {}", e))?;
 
-    let result = child
-        .wait_with_output()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to wait: {}", e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture stderr"))?;
+    let stdout_task = tokio::spawn(read_capped(stdout, BUILD_OUTPUT_LIMIT_BYTES));
+    let stderr_task = tokio::spawn(read_capped(stderr, BUILD_OUTPUT_LIMIT_BYTES));
 
-    let exit_code = result.status.code().unwrap_or(1) as i64;
-    let stdout_buf = result.stdout;
-    let stderr_buf = result.stderr;
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(BUILD_TIMEOUT_SECONDS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("failed to wait: {}", e))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(anyhow::anyhow!(
+                "command timed out after {BUILD_TIMEOUT_SECONDS} seconds"
+            ));
+        }
+    };
+
+    let exit_code = status.code().unwrap_or(1) as i64;
+    let (stdout_buf, stdout_truncated) = stdout_task
+        .await
+        .map_err(|e| anyhow::anyhow!("stdout reader failed: {}", e))?
+        .map_err(|e| anyhow::anyhow!("stdout read failed: {}", e))?;
+    let (mut stderr_buf, stderr_truncated) = stderr_task
+        .await
+        .map_err(|e| anyhow::anyhow!("stderr reader failed: {}", e))?
+        .map_err(|e| anyhow::anyhow!("stderr read failed: {}", e))?;
+    if stdout_truncated {
+        stderr_buf.extend_from_slice(b"\n[fulcr] stdout exceeded output capture limit\n");
+    }
+    if stderr_truncated {
+        stderr_buf.extend_from_slice(b"\n[fulcr] stderr exceeded output capture limit\n");
+    }
     let mut anomalies = Vec::new();
 
     // Security monitoring on output
@@ -805,6 +1895,29 @@ async fn execute_native(
     }
 
     Ok((exit_code, stdout_buf, stderr_buf, anomalies))
+}
+
+async fn read_capped<R: AsyncRead + Unpin>(
+    mut reader: R,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = cap.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+    Ok((output, truncated))
 }
 
 async fn execute_build(
@@ -981,13 +2094,29 @@ async fn read_artifact_ref(
         return Ok(None);
     }
 
-    let bytes = fs::read(&canonical).await?;
+    let size = match layer_artifact_size(&canonical).await {
+        Ok(size) => size,
+        Err(error) => {
+            *status = BuildStatus::Failed;
+            notes.push(format!(
+                "declared artifact is too large or unreadable: {error}"
+            ));
+            return Ok(None);
+        }
+    };
+    if let Err(error) = validate_oci_layer_tar_file(&canonical, size).await {
+        *status = BuildStatus::Failed;
+        notes.push(format!(
+            "declared artifact is not a valid uncompressed OCI layer tar: {error}"
+        ));
+        return Ok(None);
+    }
 
-    let digest = digest_bytes(&bytes);
+    let digest = digest_file(&canonical).await?;
     let retained = request.cache_artifact || recipe.policy.retain_artifact;
     let (path, expires_at) = if retained {
         let cache_path = state.store.cache_dir().join(cache_file_name(&digest));
-        fs::write(&cache_path, &bytes).await?;
+        fs::copy(&canonical, &cache_path).await?;
         let expires_at = if recipe.policy.cache_ttl_seconds == 0 {
             None
         } else {
@@ -1001,28 +2130,190 @@ async fn read_artifact_ref(
     };
 
     Ok(Some(ArtifactRef {
-        digest,
-        size: bytes.len() as u64,
+        digest: digest.clone(),
+        diff_id: Some(digest),
+        media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+        size,
         retained,
         path,
         expires_at,
     }))
 }
 
-fn resolve_working_dir(recipe: &Recipe, work_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
-    let mut dir = recipe
+fn validated_layer_diff_id(artifact: &ArtifactRef) -> AppResult<String> {
+    match (artifact.diff_id.as_deref(), artifact.media_type.as_deref()) {
+        (Some(diff_id), Some(OCI_LAYER_MEDIA_TYPE)) if diff_id == artifact.digest => {
+            Ok(diff_id.to_string())
+        }
+        (Some(diff_id), Some(OCI_LAYER_MEDIA_TYPE)) => Err(AppError::forbidden(format!(
+            "retained uncompressed layer diff_id {diff_id} does not match blob digest {}",
+            artifact.digest
+        ))),
+        (Some(_), Some(media_type)) => Err(AppError::forbidden(format!(
+            "retained artifact has unsupported OCI layer media type {media_type}"
+        ))),
+        _ => Err(AppError::forbidden(
+            "retained artifact lacks OCI layer diff_id or media_type metadata",
+        )),
+    }
+}
+
+async fn validate_layer_artifact_file(
+    path: &FsPath,
+    expected_digest: &str,
+    expected_size: u64,
+) -> anyhow::Result<u64> {
+    let size = layer_artifact_size(path).await?;
+    if size != expected_size {
+        anyhow::bail!("layer artifact size changed: expected {expected_size}, found {size}");
+    }
+    let digest = digest_file(path).await?;
+    if digest != expected_digest {
+        anyhow::bail!("layer artifact digest changed: expected {expected_digest}, found {digest}");
+    }
+    validate_oci_layer_tar_file(path, size).await?;
+    Ok(size)
+}
+
+fn file_body(file: fs::File) -> Body {
+    Body::from_stream(stream::try_unfold(file, |mut file| async move {
+        let mut buffer = vec![0_u8; 8192];
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buffer.truncate(read);
+            Ok::<_, std::io::Error>(Some((buffer, file)))
+        }
+    }))
+}
+
+async fn layer_artifact_size(path: &FsPath) -> anyhow::Result<u64> {
+    let size = fs::metadata(path)
+        .await
+        .with_context(|| format!("reading metadata for {}", path.display()))?
+        .len();
+    if size > MAX_LAYER_ARTIFACT_BYTES {
+        anyhow::bail!(
+            "layer artifact is {size} bytes, exceeding limit of {MAX_LAYER_ARTIFACT_BYTES} bytes"
+        );
+    }
+    Ok(size)
+}
+
+async fn digest_file(path: &FsPath) -> anyhow::Result<String> {
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
+async fn validate_oci_layer_tar_file(path: &FsPath, size: u64) -> anyhow::Result<()> {
+    if size < 1024 || !size.is_multiple_of(512) {
+        anyhow::bail!("layer tar is not 512-byte block aligned or lacks end markers");
+    }
+
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("opening layer tar {}", path.display()))?;
+        let mut archive = tar::Archive::new(file);
+        for entry in archive.entries().context("reading layer tar entries")? {
+            let entry = entry.context("reading layer tar entry")?;
+            let entry_path = entry
+                .path()
+                .context("reading layer tar entry path")?
+                .into_owned();
+            validate_safe_layer_tar_path(&entry_path, "layer tar entry path")?;
+
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_hard_link() {
+                let Some(link_name) = entry
+                    .link_name()
+                    .context("reading layer tar hard link target")?
+                else {
+                    anyhow::bail!(
+                        "layer tar hard link missing target at {}",
+                        entry_path.display()
+                    );
+                };
+                validate_safe_layer_tar_path(&link_name, "layer tar hard link target")?;
+                continue;
+            }
+            if entry_type.is_symlink() {
+                continue;
+            }
+            if !entry_type.is_file() && !entry_type.is_dir() {
+                anyhow::bail!(
+                    "unsupported layer tar entry type at {}",
+                    entry_path.display()
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+    .context("layer tar validator failed")??;
+    Ok(())
+}
+
+fn validate_safe_layer_tar_path(path: &FsPath, description: &str) -> anyhow::Result<()> {
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => has_normal_component = true,
+            Component::CurDir => {}
+            _ => anyhow::bail!("unsafe {description}: {}", path.display()),
+        }
+    }
+    if !has_normal_component {
+        anyhow::bail!("unsafe {description}: {}", path.display());
+    }
+    Ok(())
+}
+
+fn resolve_working_dir(recipe: &Recipe, work_dir: &FsPath) -> anyhow::Result<PathBuf> {
+    let work_dir = std::fs::canonicalize(work_dir)
+        .with_context(|| format!("canonicalizing work dir {}", work_dir.display()))?;
+    let source_dir = recipe
         .source
         .path
-        .clone()
-        .unwrap_or_else(|| work_dir.to_path_buf());
+        .as_deref()
+        .map(|path| anchor_under(path, &work_dir))
+        .unwrap_or_else(|| work_dir.clone());
+    let mut dir = source_dir;
     if let Some(path) = &recipe.build.working_dir {
-        dir.push(path);
+        if path.is_absolute() {
+            dir = path.clone();
+        } else {
+            dir.push(path);
+        }
     }
     let canon = std::fs::canonicalize(&dir)?;
-    if !canon.starts_with(work_dir) {
+    if !canon.starts_with(&work_dir) {
         anyhow::bail!("working directory escapes the configured work dir");
     }
     Ok(canon)
+}
+
+fn anchor_under(path: &FsPath, base: &FsPath) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 fn tail_lossy(bytes: &[u8], max: usize) -> String {

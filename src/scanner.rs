@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path, path::PathBuf};
+use std::{collections::BTreeMap, fs, io::Read, path::Path, path::PathBuf};
 
 use anyhow::Context;
 use ignore::{DirEntry, WalkBuilder};
@@ -175,11 +175,8 @@ fn scan_recipe_blocking(
                 .path
                 .as_ref()
                 .context("image archive scan requires request.path")?;
-            let archive_canon = fs::canonicalize(archive)
-                .with_context(|| format!("canonicalizing {}", archive.display()))?;
-            if !archive_canon.starts_with(work_dir) {
-                anyhow::bail!("image archive path escapes the configured work dir");
-            }
+            let archive_canon =
+                canonicalize_under_work_dir(archive, work_dir, "image archive path")?;
             let unpacked = image::unpack_image_archive(&archive_canon)?;
             scan_filesystem_report(
                 recipe,
@@ -196,11 +193,7 @@ fn scan_recipe_blocking(
                 .clone()
                 .or_else(|| recipe.source.path.clone())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let root = fs::canonicalize(&root)
-                .with_context(|| format!("canonicalizing {}", root.display()))?;
-            if !root.starts_with(work_dir) {
-                anyhow::bail!("scan root escapes the configured work dir");
-            }
+            let root = canonicalize_under_work_dir(&root, work_dir, "scan root")?;
             scan_filesystem_report(
                 recipe,
                 &root,
@@ -211,6 +204,26 @@ fn scan_recipe_blocking(
             )
         }
     }
+}
+
+fn canonicalize_under_work_dir(
+    path: &Path,
+    work_dir: &Path,
+    description: &str,
+) -> anyhow::Result<PathBuf> {
+    let work_dir = fs::canonicalize(work_dir)
+        .with_context(|| format!("canonicalizing work dir {}", work_dir.display()))?;
+    let anchored = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        work_dir.join(path)
+    };
+    let canonical = fs::canonicalize(&anchored)
+        .with_context(|| format!("canonicalizing {description} {}", anchored.display()))?;
+    if !canonical.starts_with(&work_dir) {
+        anyhow::bail!("{description} escapes the configured work dir");
+    }
+    Ok(canonical)
 }
 
 fn scan_filesystem_report(
@@ -329,6 +342,38 @@ fn scan_file(
                 category: "metadata-file-too-large".to_string(),
                 message: "metadata file exceeded scanner size limit".to_string(),
                 evidence: evidence.clone(),
+            });
+        }
+        let prefix = read_file_prefix(path, 4096).unwrap_or_default();
+        if executable || looks_binary(&prefix) || binary::is_object_magic(&prefix) {
+            let (category, vulnerability, message, justification) = if executable {
+                (
+                    "ad-hoc-binary",
+                    "fulcr-ADHOC-BINARY",
+                    "executable file exceeded scanner size limit and could not be deeply inspected",
+                    "oversized_executable_requires_triage",
+                )
+            } else {
+                (
+                    "binary-scan-skipped",
+                    "fulcr-BINARY-SCAN-SKIPPED",
+                    "binary-looking file exceeded scanner size limit and could not be deeply inspected",
+                    "oversized_binary_requires_triage",
+                )
+            };
+            scanner.findings.push(ScanFinding {
+                severity: FindingSeverity::High,
+                category: category.to_string(),
+                message: message.to_string(),
+                evidence: format!("{} ({} bytes)", evidence, metadata.len()),
+            });
+            scanner.add_vex_candidate(VexCandidate {
+                vulnerability: vulnerability.to_string(),
+                status: VexStatus::UnderInvestigation,
+                component: evidence.clone(),
+                justification: justification.to_string(),
+                detail: message.to_string(),
+                evidence,
             });
         }
         return Ok(());
@@ -1329,7 +1374,7 @@ fn enforce_dependency_spec_policy(
     evidence: &str,
     scanner: &mut ScannerState,
 ) {
-    if !is_exact_version_spec(spec) {
+    if !is_exact_version_spec(ecosystem, spec) {
         add_sbom_policy_finding(
             scanner,
             FindingSeverity::High,
@@ -1488,6 +1533,13 @@ fn add_component(
 }
 
 fn package_url(kind: &str, name: &str, version: Option<&str>) -> Option<String> {
+    if kind == "cargo-declared" {
+        return Some(match version.and_then(exact_cargo_version_value) {
+            Some(version) => format!("pkg:cargo/{name}@{version}"),
+            None => format!("pkg:cargo/{name}"),
+        });
+    }
+
     if kind == "maven" {
         return Some(match (name.split_once(':'), version) {
             (Some((group, artifact)), Some(version)) => {
@@ -1550,7 +1602,11 @@ fn contains_secret_or_publish_indicator(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn is_exact_version_spec(spec: &str) -> bool {
+fn is_exact_version_spec(ecosystem: &str, spec: &str) -> bool {
+    if ecosystem == "cargo" {
+        return is_exact_cargo_version_spec(spec);
+    }
+
     let spec = spec.trim().trim_start_matches('=').trim_start_matches('v');
     if spec.is_empty() {
         return false;
@@ -1593,6 +1649,16 @@ fn is_exact_version_spec(spec: &str) -> bool {
     }
 
     false
+}
+
+fn is_exact_cargo_version_spec(spec: &str) -> bool {
+    exact_cargo_version_value(spec).is_some()
+}
+
+fn exact_cargo_version_value(spec: &str) -> Option<&str> {
+    let version = spec.trim().strip_prefix('=')?;
+    let version = version.trim().trim_start_matches('v');
+    semver::Version::parse(version).is_ok().then_some(version)
 }
 
 fn parse_pem_blocks(path: &Path, evidence: &str, text: &str, scanner: &mut ScannerState) {
@@ -1745,6 +1811,14 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(1024).any(|byte| *byte == 0)
 }
 
+fn read_file_prefix(path: &Path, max: usize) -> anyhow::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    let mut prefix = vec![0_u8; max];
+    let read = file.read(&mut prefix)?;
+    prefix.truncate(read);
+    Ok(prefix)
+}
+
 #[cfg(unix)]
 fn is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1894,6 +1968,53 @@ version = "1.0.0"
             .any(|candidate| candidate.vulnerability == "fulcr-ADHOC-BINARY"));
     }
 
+    #[test]
+    fn scanner_anchors_relative_request_path_under_work_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(work_dir.join("checkout")).unwrap();
+        fs::write(
+            work_dir.join("checkout/package.json"),
+            "{\"name\":\"service\"}\n",
+        )
+        .unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: BuilderRef {
+                kind: BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+
+        let report = scan_recipe_blocking(
+            &recipe,
+            ScanRequest {
+                mode: ScanMode::Source,
+                path: Some(PathBuf::from("checkout")),
+                max_file_bytes: None,
+            },
+            &work_dir,
+        )
+        .unwrap();
+
+        assert_eq!(report.root, work_dir.join("checkout"));
+    }
+
     #[tokio::test]
     async fn scanner_reconstructs_docker_archive_rootfs() {
         let temp = tempfile::tempdir().unwrap();
@@ -1989,6 +2110,65 @@ version = "1.0.0"
             .components
             .iter()
             .any(|component| component.name == "bash" && component.kind == "deb"));
+    }
+
+    #[tokio::test]
+    async fn scanner_flags_oversized_executable_before_size_skip() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = fs::canonicalize(temp.path())
+            .unwrap()
+            .as_path()
+            .join("large-tool");
+        fs::write(&binary, b"\x7fELF\0oversized fixture").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "abc123".to_string(),
+                path: Some(
+                    fs::canonicalize(temp.path())
+                        .unwrap()
+                        .as_path()
+                        .to_path_buf(),
+                ),
+            },
+            builder: BuilderRef {
+                kind: BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some("sha256:builder".to_string()),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+
+        let report = scan_recipe(
+            &recipe,
+            ScanRequest {
+                mode: ScanMode::Source,
+                path: None,
+                max_file_bytes: Some(4),
+            },
+            fs::canonicalize(temp.path()).unwrap().as_path(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.category == "ad-hoc-binary"));
+        assert!(report
+            .vex_candidates
+            .iter()
+            .any(|candidate| candidate.vulnerability == "fulcr-ADHOC-BINARY"));
     }
 
     #[tokio::test]
@@ -2223,5 +2403,25 @@ packages:
             .findings
             .iter()
             .any(|finding| finding.category == "sbom-missing-integrity"));
+    }
+
+    #[test]
+    fn cargo_bare_semver_is_not_exact_pin() {
+        assert!(!is_exact_version_spec("cargo", "1.0.228"));
+        assert!(!is_exact_version_spec("cargo", "^1.0.228"));
+        assert!(is_exact_version_spec("cargo", "=1.0.228"));
+        assert!(is_exact_version_spec("npm", "1.0.228"));
+    }
+
+    #[test]
+    fn cargo_declared_purl_uses_only_exact_version_value() {
+        assert_eq!(
+            package_url("cargo-declared", "serde", Some("=1.0.228")),
+            Some("pkg:cargo/serde@1.0.228".to_string())
+        );
+        assert_eq!(
+            package_url("cargo-declared", "serde", Some("1.0.228")),
+            Some("pkg:cargo/serde".to_string())
+        );
     }
 }
