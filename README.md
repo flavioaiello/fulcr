@@ -1,6 +1,6 @@
 # fulcr
 
-`fulcr` is a metadata-first virtual OCI registry for containerized developer environments such as DevContainers. It treats source, locked inputs, builder identity, SBOM, CBOM, VEX, SLSA provenance, scans, attestations, and policy decisions as the durable artifact. Image bytes are derived materializations: they may be built explicitly, cached temporarily, served through normal OCI read paths, or denied by policy, but they are not the registry's source of truth.
+`fulcr` is a metadata-first virtual OCI registry for containerized developer environments such as DevContainers. It treats source, locked inputs, builder identity, SBOM, CBOM, VEX, SLSA provenance, scans, attestations, and policy decisions as the durable artifact. Image bytes are derived materializations: prebuilt OCI layers may be imported explicitly, cached temporarily, served through normal OCI read paths, or denied by policy, but they are not the registry's source of truth.
 
 The value proposition is both security and storage: unsafe images are never materialized into developer workstations, CI runners, or runtimes, and rarely reused image layers do not accumulate as permanent registry state. Conventional registries keep the pile of image blobs first and attach proof later; `fulcr` keeps the proof first and creates the pile only when policy allows it.
 
@@ -68,10 +68,10 @@ The registry MUST store and process metadata as first-class OCI artifacts. It MU
 
 - CycloneDX-style SBOM output from detected package manifests, lockfiles, and OS package databases
 - CBOM-style crypto inventory from certificates, keys, crypto libraries, protocols, algorithms, and crypto-relevant config
-- VEX candidates for findings that require exploitability triage
+- autonomous vulnerability assessments with evidence and VEX status
 - scan findings for suspicious build scripts, ad-hoc binaries, crypto drift, and metadata misalignment
 
-The scanner uses specialized Rust crates for the parts that should not be hand-parsed in normal operation: `ignore` for gitignore-aware traversal, `cargo-lock` for Cargo lockfiles, `toml` for Cargo manifests, `serde_json` for npm lockfiles and manifests, `serde_yaml_ng` for pnpm lockfiles, `roxmltree` for Maven POMs, `pem` and `x509-parser` for PEM and certificate material, `semver` for exact-version validation, `tar`, `flate2`, and `zstd` for image archives, `object` for binary metadata, and `sha2` for content digests.
+The scanner uses specialized Rust crates for the parts that should not be hand-parsed in normal operation: `ignore` for bounded filesystem traversal, `cargo-lock` for Cargo lockfiles, `toml` for Cargo manifests, `serde_json` for npm lockfiles and manifests, `serde_yaml_ng` for pnpm lockfiles, `roxmltree` for Maven POMs, `pem` and `x509-parser` for PEM and certificate material, `semver` for exact-version validation, `tar`, `flate2`, and `zstd` for image archives, `object` for binary metadata, and `sha2` for content digests.
 
 The scan request supports three modes:
 
@@ -101,14 +101,28 @@ The scanner also turns SBOM and CBOM into gateable posture evidence. SBOM policy
 
 These controls intentionally sit beside VEX rather than replacing it. SBOM/CBOM findings answer whether the dependency and crypto posture is acceptable before a derived image is materialized; VEX answers whether a known vulnerability is exploitable in this image context.
 
-To bridge the gap between abstract metadata and real-world exploitation, `fulcr` employs a hybrid VEX (Vulnerability Exploitability eXchange) model:
+### Autonomous VEX
 
-- **Implicit VEX (The Baseline):** Since `fulcr` natively generates exact Package URLs (PURLs) via its SBOM scanner, it can implicitly connect the dots by checking dependencies against structured OSV feeds (like OSV.dev or GitHub Advisories). Matches automatically generate a `VexCandidate` with an `under_investigation` or `affected` status in the scan report, providing out-of-the-box CVE protection without requiring external scanning tools.
-- **Explicit VEX (The Override):** When an implicit OSV match flags a vulnerability, security teams and CI systems can supply explicit OpenVEX documents via the `/v1/recipes/:id/vex` endpoint to override the finding. Because these VEX statements are cryptographically anchored to the `fulcr` recipe digest, an override like `not_affected` cleanly unblocks the image pull while keeping a signed, verifiable record that applies *only* to that exact build context.
+`fulcr` does not require a person to turn an OSV match into a final decision. It treats OSV as vulnerability evidence, inspects the exact retained artifact, emits its own OpenVEX-compatible assessment, and either serves or denies autonomously:
+
+1. A source OSV match produces an `under_investigation` assessment and does not by itself prevent passive artifact intake.
+2. Fulcr validates and copies the declared layer into immutable content-addressed storage without executing it.
+3. Fulcr reconstructs and scans the exact retained bytes and compares source and artifact component evidence.
+4. If the exact artifact still matches the vulnerability, Fulcr emits `affected` and denies.
+5. If the artifact contains a changed exact component version and a completed OSV lookup does not report that vulnerability, Fulcr emits `fixed` and may allow.
+6. If evidence is incomplete, including inventory absence without package-to-file ownership or reachability proof, Fulcr emits `under_investigation` and denies. Autonomous denial is a final valid result; no interaction is required.
+
+Fulcr will emit `not_affected` only when a future or configured analyzer provides deterministic artifact-bound non-exploitability evidence. It does not currently treat a missing inventory entry as proof because compiled, bundled, vendored, or stripped vulnerable code may still be present.
+
+OSV mode defaults to `required`, so Fulcr autonomously performs the lookup and fails closed without caller interaction. `best_effort` follows `policy.require_osv`, while `disabled` makes no request and must be selected explicitly. `FULCR_OSV_URL` defaults to OSV.dev and can point to a private mirror.
+
+`POST /v1/recipes/:id/vex` remains an optional administrative interoperability path, not part of the autonomous success flow. External `not_affected` exceptions are disabled by default (`policy.allow_external_vex_overrides = false`), require the exact current artifact subject (`urn:oci:blob:<digest>`), component, justification, detail, author, and a future RFC3339 `expires_at`, and can resolve only an autonomous `under_investigation` result until expiry. They cannot override autonomous `affected`, and external `fixed` assertions are rejected because Fulcr derives `fixed` from exact artifact and OSV evidence. These administrative records are bearer-authenticated and recipe/artifact-bound, but they are not cryptographically signed attestations.
 
 Binary deep scanning is part of every filesystem and image scan. Binary-looking files are inspected for ELF, Mach-O, and PE metadata where possible, including format, architecture, entrypoint, sections, imported or undefined symbols, inferred linked libraries, and security-relevant strings. The scanner uses this to identify linked crypto libraries, legacy crypto primitives, network-capable binaries, and ad-hoc executable files.
 
 The scanner output is persisted as durable metadata. `/v1/recipes/:id/sbom` and `/v1/recipes/:id/cbom` return the latest scan-derived documents when a scan exists, otherwise they fall back to recipe-declared metadata.
+
+Source scans do not honor repository `.gitignore`, global Git excludes, or conventional generated-directory names. They traverse the complete configured source root under global file and byte budgets, excluding only the exact registry data directory configured by the operator. Budget exhaustion produces a persisted failed scan with a High `scan-incomplete` finding rather than silently omitting content. Each report commits to a canonical digest of every regular file, symlink target, and relevant permission mode in the bounded tree.
 
 ## SLSA Provenance
 
@@ -132,7 +146,7 @@ The SLSA predicate records:
 - latest build invocation ID and timestamps when a build exists
 - output artifact subject digest when a build produced an artifact
 
-`fulcr` also evaluates a tightened SLSA posture policy. The policy requires an immutable source revision, a sha256-pinned builder, sha256-digested materials, latest scan evidence for the recipe digest, durable metadata-only retention, and build evidence that matches the recipe whenever a build record exists. The SLSA document exposes these checks under `predicate.runDetails.metadata.fulcrSlsaPolicy`, and the materialization gate denies by default when the policy is not satisfied.
+`fulcr` also evaluates a tightened SLSA posture policy. The policy requires an immutable source revision, a sha256-pinned builder, sha256-digested materials, latest scan evidence for the recipe digest, durable metadata-only retention, and build evidence that matches the recipe whenever a build record exists. A successful import is bound to a persisted source scan whose canonical digest is revalidated whenever the gate or SLSA document is read. The declared layer file must match the source-scan digest, the complete source-tree digest must remain unchanged through CAS publication, and the retained layer must have scan evidence bound to its exact digest. The SLSA document exposes these checks under `predicate.runDetails.metadata.fulcrSlsaPolicy`, and the materialization gate denies by default when the policy is not satisfied.
 
 SLSA is not the whole security model. In `fulcr`, SLSA is the interoperable provenance receipt and provenance completeness signal; SBOM and CBOM are inventories and posture controls; VEX is the exploitability assertion; scan reports are evidence; the metadata gate is the registry verdict.
 
@@ -145,9 +159,9 @@ SLSA is not the whole security model. In `fulcr`, SLSA is the interoperable prov
 - CBOM findings for private key material, crypto policy drift, weak primitives, weak key-size hints, or EOL crypto libraries
 - SLSA findings for unpinned source revisions, missing builder digests, undigested materials, missing or stale scan evidence, stale or failed build evidence, incomplete build timestamps, or disabled durable metadata-only retention
 - scan findings for ad-hoc binaries, suspicious build behavior, or metadata misalignment
-- VEX candidates that still require triage
+- autonomous vulnerability assessments that are `affected` or `under_investigation`
 
-Build execution and OCI manifest resolution call the same gate. If the latest metadata is denied, `fulcr` refuses to build, materialize, or serve a manifest for that recipe.
+Passive artifact intake ignores only source OSV vulnerability matches so Fulcr can inspect the exact retained bytes. Every other source policy violation still denies intake. OCI manifest and blob resolution use the final autonomous gate. `fulcr` never executes recipe commands on the registry host.
 
 ## Future Sandbox Extension
 
@@ -160,12 +174,12 @@ Runtime sandboxing is intentionally not part of the current implementation. It c
 | Persona | OCI Use-Case | `fulcr` Behavior |
 |---|---|---|
 | Developer | Pull, build, or inspect a dependency-backed image | Receives only images whose dependency, crypto, VEX, and provenance posture passed the metadata gate |
-| CI runner | Build or test source-bound artifacts | Gets an allow/deny decision before build scripts can execute with CI credentials or package tokens nearby |
+| CI runner | Build or test source-bound artifacts | Builds outside the registry, then imports a layer only after source metadata passes the gate |
 | Image producer | Register source metadata or future pushed-image evidence | Registers recipes today; future push intake can convert uploaded bytes into metadata |
 | OCI registry | Serve manifests, descriptors, blobs, and referrers | Resolves metadata, applies the gate, and serves only approved available materializations |
 | OCI client | Pull an image by tag or digest | Receives OCI-compliant manifests and byte streams only when descriptors and blobs are already available to serve |
 | Runtime or orchestrator | Deploy an image | Pulls through standard OCI behavior and enforces digest identity |
-| Security scanner | Discover SBOM, CBOM, VEX, SLSA, and attestations | Reads OCI artifacts and referrers attached to the recipe or image digest |
+| Security scanner | Discover SBOM, CBOM, VEX, SLSA, and attestations | Reads OCI 1.1 artifacts and referrers attached to the materialized image-manifest digest |
 | Auditor | Trace deployed software to source and evidence | Reviews recipe, materials, metadata digests, SLSA provenance, VEX status, and build records |
 
 ## Future Push Intake Flow
@@ -221,11 +235,11 @@ VEX is the gate between preserved metadata and derived binary materialization.
 |---|---|---|
 | `not_affected` | Allow | The vulnerable condition is not exploitable for this image context |
 | `fixed` | Allow when the fixed component is present | The image context contains the remediation |
-| `affected` | Deny unless an explicit exception policy allows it | The vulnerability is relevant to this image context |
+| `affected` | Deny | The exact artifact still matches the vulnerability; external exceptions cannot override it |
 | `under_investigation` | Deny by default for production | The registry cannot yet prove acceptable risk |
 | missing VEX for required CVE | Deny by default for production | The registry lacks an accountable exploitability statement |
 
-The policy engine MAY vary these defaults by environment, but it MUST record the decision as durable metadata. A denied pull MUST NOT trigger materialization.
+The policy engine records every autonomous decision as durable metadata. A denied pull MUST NOT execute or stream the retained artifact.
 
 ## Gherkin Requirements
 
@@ -377,7 +391,7 @@ GET  /v2/<name>/referrers/<digest>
 
 Push/upload endpoints are not implemented yet; this prototype currently accepts recipes and evidence through the metadata API and serves policy-gated OCI read paths.
 
-Metadata API routes and OCI content routes require `Authorization: Bearer <fulcr_TOKEN>`. `/healthz` and `/v2/` remain open for local inspection.
+Metadata API routes and OCI content routes require authentication. API callers may use `Authorization: Bearer <FULCR_TOKEN>`; OCI clients receive a Basic challenge and use the token as the password. `/healthz` and `/v2/` remain open for local inspection. The built-in server is plaintext and refuses non-loopback binds unless `FULCR_ALLOW_INSECURE_REMOTE=true`; put a TLS reverse proxy on loopback for remote use.
 
 The metadata API is an administrative interface for recipes, policy, and evidence. It MUST NOT replace OCI client compatibility:
 
@@ -418,8 +432,10 @@ This makes the value proposition observable: source and metadata become the dura
 
 ## Run
 
+`fulcr` is pinned to Rust 1.97.1.
+
 ```bash
-export fulcr_TOKEN=replace-with-local-token
+export FULCR_TOKEN=replace-with-local-token
 cargo run -- --bind 127.0.0.1:8080 --data-dir .fulcr
 ```
 
@@ -428,7 +444,7 @@ Register a recipe:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes \
   -H 'content-type: application/json' \
-  -H "authorization: Bearer $fulcr_TOKEN" \
+  -H "authorization: Bearer $FULCR_TOKEN" \
   --data @examples/recipe.json | jq .
 ```
 
@@ -437,32 +453,24 @@ Create source scan evidence before materialization:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/scans \
   -H 'content-type: application/json' \
-  -H "authorization: Bearer $fulcr_TOKEN" \
+  -H "authorization: Bearer $FULCR_TOKEN" \
   --data '{"mode":"source"}' | jq .
 ```
 
-Add VEX metadata:
+Inspect Fulcr's autonomous assessments after artifact intake:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/vex \
-  -H 'content-type: application/json' \
-  -H "authorization: Bearer $fulcr_TOKEN" \
-  --data '{
-    "vulnerability": "CVE-2026-1234",
-    "status": "not_affected",
-    "recipe_digest": "<recipe-digest-from-recipe-response>",
-    "component": "example-lib",
-    "justification": "vulnerable_code_not_present",
-    "detail": "The vulnerable parser is excluded by this build profile.",
-    "author": "platform-security"
-  }' | jq .
+curl -sS http://127.0.0.1:8080/v1/recipes/<recipe-id>/vex \
+  -H "authorization: Bearer $FULCR_TOKEN" | jq .
 ```
+
+No VEX POST is required in the normal workflow. An operator that deliberately enables `policy.allow_external_vex_overrides` may POST a fully evidenced `not_affected` administrative exception for an inconclusive assessment; Fulcr rejects such requests by default.
 
 Request SLSA provenance:
 
 ```bash
 curl -sS http://127.0.0.1:8080/v1/recipes/<recipe-id>/slsa \
-  -H "authorization: Bearer $fulcr_TOKEN" | jq .
+  -H "authorization: Bearer $FULCR_TOKEN" | jq .
 ```
 
 Plan a materialization record without executing a build:
@@ -470,17 +478,29 @@ Plan a materialization record without executing a build:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/builds \
   -H 'content-type: application/json' \
-  -H "authorization: Bearer $fulcr_TOKEN" \
+  -H "authorization: Bearer $FULCR_TOKEN" \
   --data '{"execute": false}' | jq .
 ```
 
-To pre-materialize an image before the first OCI manifest request, run the recipe build and cache its OCI layer artifact:
+To pre-materialize an image before the first OCI manifest request, create the declared uncompressed OCI layer outside `fulcr`, then import it. The registry takes a fresh full-tree source scan, validates that the copied layer matches the scanned artifact file, publishes it without overwriting existing CAS content, rechecks the source tree, reconstructs the layer, and scans the exact retained bytes. It does not execute `build.command`:
+
+```bash
+tar -cf examples/hello-service/layer.tar -C examples/hello-service hello.txt
+```
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/recipes/<recipe-id>/builds \
   -H 'content-type: application/json' \
-  -H "authorization: Bearer $fulcr_TOKEN" \
+  -H "authorization: Bearer $FULCR_TOKEN" \
   --data '{"execute": true, "cache_artifact": true}' | jq .
 ```
 
-Only run executable recipes from trusted local sources. `fulcr` is a prototype developer-protection registry, not a public multi-tenant build service.
+The build response contains `policy_decision`. `status: succeeded` means passive artifact intake completed; `policy_decision.outcome` is the autonomous serve/deny verdict. A denied artifact remains available only as quarantined evidence and is never exposed through OCI pull paths.
+
+For a standard OCI login flow, use any username and the configured token as the password:
+
+```bash
+printf '%s' "$FULCR_TOKEN" | docker login 127.0.0.1:8080 --username fulcr --password-stdin
+```
+
+`fulcr` is a prototype developer-protection registry, not a public multi-tenant service.

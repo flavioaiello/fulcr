@@ -3,7 +3,7 @@
   "source": {
     "repo": "https://example.invalid/hello-service.git",
     "revision": "0123456789abcdef0123456789abcdef01234567",
-    "path": "."
+    "path": "examples/hello-service"
   },
   "builder": {
     "kind": "script",
@@ -11,19 +11,21 @@
     "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   },
   "build": {
-    "command": ["/bin/sh", "-c", "tar -cf layer.tar README.md"],
+    "command": [],
     "artifact": "layer.tar"
   },
   "materials": [
     {
-      "name": "README.md",
-      "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "name": "hello.txt",
+      "digest": "sha256:15fd80bb37b01af94275c4e80e50fccd7db0f5de29a5427405484f9196ec56b4",
       "kind": "source-file"
     }
   ],
   "policy": {
     "durable_metadata_only": true,
-    "retain_artifact": false,
+    "require_osv": true,
+    "allow_external_vex_overrides": false,
+    "retain_artifact": true,
     "cache_ttl_seconds": 900
   }
 }

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use object::{Object, ObjectSection, ObjectSymbol};
 
 use crate::models::{
-    BinaryAnalysis, FindingSeverity, ScanFinding, ScannedCryptoMaterial, VexCandidate, VexStatus,
+    BinaryAnalysis, FindingSeverity, ScanFinding, ScannedCryptoMaterial, VulnerabilityAssessment,
 };
 
 const MAX_BINARY_STRINGS: usize = 48;
@@ -14,7 +14,7 @@ pub struct BinaryScanOutput {
     pub analysis: BinaryAnalysis,
     pub findings: Vec<ScanFinding>,
     pub crypto: Vec<ScannedCryptoMaterial>,
-    pub vex_candidates: Vec<VexCandidate>,
+    pub vulnerability_assessments: Vec<VulnerabilityAssessment>,
 }
 
 pub fn analyze_binary(evidence: &str, bytes: &[u8]) -> Option<BinaryScanOutput> {
@@ -47,20 +47,20 @@ pub fn analyze_binary(evidence: &str, bytes: &[u8]) -> Option<BinaryScanOutput> 
 
         let mut symbols = BTreeSet::new();
         for symbol in file.dynamic_symbols() {
-            if let Ok(name) = symbol.name() {
-                if symbol.is_undefined() || is_interesting_symbol(name) {
-                    symbols.insert(name.to_string());
-                }
+            if let Ok(name) = symbol.name()
+                && (symbol.is_undefined() || is_interesting_symbol(name))
+            {
+                symbols.insert(name.to_string());
             }
         }
         for symbol in file.symbols() {
             if symbols.len() >= MAX_BINARY_SYMBOLS {
                 break;
             }
-            if let Ok(name) = symbol.name() {
-                if is_interesting_symbol(name) {
-                    symbols.insert(name.to_string());
-                }
+            if let Ok(name) = symbol.name()
+                && is_interesting_symbol(name)
+            {
+                symbols.insert(name.to_string());
             }
         }
 
@@ -77,7 +77,7 @@ pub fn analyze_binary(evidence: &str, bytes: &[u8]) -> Option<BinaryScanOutput> 
 
     let mut findings = Vec::new();
     let mut crypto = Vec::new();
-    let mut vex_candidates = Vec::new();
+    let vulnerability_assessments = Vec::new();
 
     let joined = analysis
         .symbols
@@ -121,6 +121,12 @@ pub fn analyze_binary(evidence: &str, bytes: &[u8]) -> Option<BinaryScanOutput> 
         ("sha1", "SHA-1", FindingSeverity::Low),
     ] {
         if joined.contains(needle) {
+            let severity = if matches!(severity, FindingSeverity::High | FindingSeverity::Critical)
+            {
+                FindingSeverity::Medium
+            } else {
+                severity
+            };
             crypto.push(ScannedCryptoMaterial {
                 name: algorithm.to_string(),
                 kind: "binary-crypto-primitive".to_string(),
@@ -134,14 +140,6 @@ pub fn analyze_binary(evidence: &str, bytes: &[u8]) -> Option<BinaryScanOutput> 
                 message: format!(
                     "legacy or sensitive crypto primitive observed in binary: {algorithm}"
                 ),
-                evidence: evidence.to_string(),
-            });
-            vex_candidates.push(VexCandidate {
-                vulnerability: "fulcr-BINARY-CRYPTO-POLICY-DRIFT".to_string(),
-                status: VexStatus::UnderInvestigation,
-                component: evidence.to_string(),
-                justification: "binary_crypto_policy_requires_triage".to_string(),
-                detail: format!("{algorithm} was observed in binary metadata or strings."),
                 evidence: evidence.to_string(),
             });
         }
@@ -160,7 +158,7 @@ pub fn analyze_binary(evidence: &str, bytes: &[u8]) -> Option<BinaryScanOutput> 
         analysis,
         findings,
         crypto,
-        vex_candidates,
+        vulnerability_assessments,
     })
 }
 
@@ -262,13 +260,17 @@ mod tests {
     fn analyzes_opaque_binary_strings() {
         let bytes = b"\0\0openssl TLSv1.0 https://callback.example.invalid\0";
         let output = analyze_binary("bin/tool", bytes).unwrap();
-        assert!(output
-            .crypto
-            .iter()
-            .any(|item| item.name == "OpenSSL" || item.algorithm.as_deref() == Some("TLS 1.0")));
-        assert!(output
-            .findings
-            .iter()
-            .any(|finding| finding.category == "binary-network-capability"));
+        assert!(
+            output
+                .crypto
+                .iter()
+                .any(|item| item.name == "OpenSSL" || item.algorithm.as_deref() == Some("TLS 1.0"))
+        );
+        assert!(
+            output
+                .findings
+                .iter()
+                .any(|finding| finding.category == "binary-network-capability")
+        );
     }
 }

@@ -5,21 +5,19 @@ use std::{
 
 use anyhow::Context;
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Path, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::stream;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::{
-    fs,
-    io::{AsyncRead, AsyncReadExt},
-};
+use tokio::{fs, io::AsyncReadExt};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -30,22 +28,22 @@ use crate::{
     digest::{cache_file_name, digest_bytes},
     gate,
     metadata::{
-        attestation_document, cbom_document, openvex_document, sbom_document,
-        slsa_provenance_document,
+        attestation_document, cbom_document, combined_vex_statements, openvex_document,
+        sbom_document, scan_evidence_digest, slsa_provenance_document,
     },
     models::{
-        oci_image_config_bytes, oci_image_config_bytes_for_layers, timestamp,
-        timestamp_after_seconds, ArtifactRef, BuildRecord, BuildRequest, BuildStatus, GateDecision,
-        GateOutcome, Recipe, RecipeInput, ScanReport, ScanRequest, VexInput, VexStatement,
+        ArtifactRef, BuildRecord, BuildRequest, BuildStatus, GateDecision, GateOutcome, Recipe,
+        RecipeInput, ScanReport, ScanRequest, VexInput, VexStatement, oci_image_config_bytes,
+        oci_image_config_bytes_for_layers, timestamp, timestamp_after_seconds,
     },
     scanner,
     store::Store,
 };
 
-const BUILD_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
-const BUILD_TIMEOUT_SECONDS: u64 = 15 * 60;
 const MAX_LAYER_ARTIFACT_BYTES: u64 = 1_073_741_824;
 const OCI_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+const OCI_EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
+const OCI_EMPTY_CONFIG_BYTES: &[u8] = b"{}";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,7 +56,7 @@ pub fn router(store: Store, work_dir: PathBuf) -> Router {
     router_with_auth(
         store,
         work_dir,
-        std::env::var("fulcr_TOKEN")
+        std::env::var("FULCR_TOKEN")
             .ok()
             .filter(|token| !token.trim().is_empty()),
     )
@@ -68,7 +66,7 @@ pub fn router_with_auth(store: Store, work_dir: PathBuf, auth_token: Option<Stri
     let auth_token = auth_token.filter(|token| !token.trim().is_empty());
     if auth_token.is_none() {
         tracing::warn!(
-            "fulcr_TOKEN is not set; protected endpoints will reject requests until a bearer token is configured."
+            "FULCR_TOKEN is not set; protected endpoints will reject requests until a token is configured."
         );
     }
     let state = AppState {
@@ -89,24 +87,24 @@ pub fn router_with_auth(store: Store, work_dir: PathBuf, auth_token: Option<Stri
         .route("/healthz", get(healthz))
         .route("/v2/", get(oci_health).head(oci_health))
         .route(
-            "/v2/*path",
+            "/v2/{*path}",
             get(oci_distribution).head(oci_distribution_head),
         )
         .route("/v1/recipes", get(list_recipes).post(create_recipe))
-        .route("/v1/recipes/:id", get(get_recipe))
+        .route("/v1/recipes/{id}", get(get_recipe))
         .route(
-            "/v1/recipes/:id/builds",
+            "/v1/recipes/{id}/builds",
             get(list_builds).post(create_build),
         )
-        .route("/v1/recipes/:id/scans", get(list_scans).post(create_scan))
-        .route("/v1/recipes/:id/scans/:scan_id", get(get_scan))
-        .route("/v1/recipes/:id/gate", get(get_gate))
-        .route("/v1/recipes/:id/sbom", get(get_sbom))
-        .route("/v1/recipes/:id/cbom", get(get_cbom))
-        .route("/v1/recipes/:id/vex", get(get_vex).post(add_vex))
-        .route("/v1/recipes/:id/openvex", get(get_openvex))
-        .route("/v1/recipes/:id/slsa", get(get_slsa))
-        .route("/v1/recipes/:id/attestation", get(get_attestation))
+        .route("/v1/recipes/{id}/scans", get(list_scans).post(create_scan))
+        .route("/v1/recipes/{id}/scans/{scan_id}", get(get_scan))
+        .route("/v1/recipes/{id}/gate", get(get_gate))
+        .route("/v1/recipes/{id}/sbom", get(get_sbom))
+        .route("/v1/recipes/{id}/cbom", get(get_cbom))
+        .route("/v1/recipes/{id}/vex", get(get_vex).post(add_vex))
+        .route("/v1/recipes/{id}/openvex", get(get_openvex))
+        .route("/v1/recipes/{id}/slsa", get(get_slsa))
+        .route("/v1/recipes/{id}/attestation", get(get_attestation))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -123,37 +121,53 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
         return next.run(request).await;
     }
 
+    let oci_request = path.starts_with("/v2/");
+
     let Some(expected) = state.auth_token.as_ref() else {
-        return unauthorized_response("fulcr_TOKEN is required for protected endpoints");
+        return unauthorized_response(
+            "FULCR_TOKEN is required for protected endpoints",
+            oci_request,
+        );
     };
 
-    let presented = request
+    let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
+        .and_then(|value| value.to_str().ok());
+    let presented = authorization.and_then(presented_token);
 
     match presented {
         Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
             next.run(request).await
         }
-        _ => unauthorized_response("missing or invalid bearer token"),
+        _ => unauthorized_response("missing or invalid bearer token", oci_request),
     }
 }
 
-fn unauthorized_response(message: impl Into<String>) -> Response {
+fn unauthorized_response(message: impl Into<String>, oci: bool) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::WWW_AUTHENTICATE,
-        HeaderValue::from_static(r#"Bearer realm="fulcr""#),
+        HeaderValue::from_static(r#"Basic realm="fulcr""#),
     );
-    (
-        StatusCode::UNAUTHORIZED,
-        headers,
-        Json(json!({ "error": message.into() })),
-    )
-        .into_response()
+    let message = message.into();
+    if oci {
+        (
+            StatusCode::UNAUTHORIZED,
+            headers,
+            Json(json!({
+                "errors": [{ "code": "UNAUTHORIZED", "message": message }]
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            headers,
+            Json(json!({ "error": message })),
+        )
+            .into_response()
+    }
 }
 
 fn request_needs_auth(method: &Method, path: &str) -> bool {
@@ -168,14 +182,24 @@ fn request_needs_auth(method: &Method, path: &str) -> bool {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let a = Sha256::digest(a);
+    let b = Sha256::digest(b);
     let mut diff = 0_u8;
     for (left, right) in a.iter().zip(b.iter()) {
         diff |= left ^ right;
     }
     diff == 0
+}
+
+fn presented_token(authorization: &str) -> Option<String> {
+    if let Some(token) = authorization.strip_prefix("Bearer ") {
+        return Some(token.trim().to_string());
+    }
+    let encoded = authorization.strip_prefix("Basic ")?.trim();
+    let decoded = BASE64_STANDARD.decode(encoded).ok()?;
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    let (_, password) = decoded.split_once(':')?;
+    Some(password.to_string())
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -204,17 +228,12 @@ async fn oci_referrers_response(
         if candidate.name != name {
             continue;
         }
-        if candidate.digest == digest {
-            let subject = MetadataSubject::recipe(&candidate);
+        if let Ok(manifest) = materialized_image_manifest(&state, &candidate).await
+            && manifest.digest == digest
+        {
+            let subject = MetadataSubject::image(&manifest);
             recipe_with_subject = Some((candidate, subject));
             break;
-        }
-        if let Ok(manifest) = materialized_image_manifest(&state, &candidate).await {
-            if manifest.digest == digest {
-                let subject = MetadataSubject::image(&manifest);
-                recipe_with_subject = Some((candidate, subject));
-                break;
-            }
         }
     }
     let Some((recipe, subject)) = recipe_with_subject else {
@@ -234,7 +253,7 @@ async fn oci_referrers_response(
         ]);
         descriptors.push(
             DescriptorBuilder::default()
-                .media_type(MediaType::ArtifactManifest)
+                .media_type(MediaType::ImageManifest)
                 .artifact_type(MediaType::Other(document.artifact_type.to_string()))
                 .digest(parse_oci_digest(&document.manifest_digest)?)
                 .size(document.manifest_bytes.len() as u64)
@@ -285,17 +304,22 @@ async fn oci_distribution_response(
     state: AppState,
     include_body: bool,
 ) -> AppResult<Response> {
-    match parse_oci_route(&path)? {
-        OciRoute::Manifest { name, reference } => {
-            oci_manifest_response(name, reference, state, include_body).await
-        }
-        OciRoute::Blob { name, digest } => {
-            oci_blob_response(name, digest, state, include_body).await
-        }
-        OciRoute::Referrers { name, digest } => {
-            oci_referrers_response(name, digest, state, include_body).await
-        }
-    }
+    let route = parse_oci_route(&path).map_err(|error| error.into_oci("NAME_UNKNOWN"))?;
+    let (result, not_found_code) = match route {
+        OciRoute::Manifest { name, reference } => (
+            oci_manifest_response(name, reference, state, include_body).await,
+            "MANIFEST_UNKNOWN",
+        ),
+        OciRoute::Blob { name, digest } => (
+            oci_blob_response(name, digest, state, include_body).await,
+            "BLOB_UNKNOWN",
+        ),
+        OciRoute::Referrers { name, digest } => (
+            oci_referrers_response(name, digest, state, include_body).await,
+            "MANIFEST_UNKNOWN",
+        ),
+    };
+    result.map_err(|error| error.into_oci(not_found_code))
 }
 
 enum OciRoute {
@@ -392,13 +416,269 @@ mod tests {
 
     #[test]
     fn unauthorized_response_advertises_bearer_auth() {
-        let response = unauthorized_response("missing token");
+        let response = unauthorized_response("missing token", true);
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
-            r#"Bearer realm="fulcr""#
+            r#"Basic realm="fulcr""#
         );
+    }
+
+    #[test]
+    fn accepts_bearer_and_basic_tokens() {
+        assert_eq!(
+            presented_token("Bearer secret-token").as_deref(),
+            Some("secret-token")
+        );
+        assert_eq!(
+            presented_token("Basic ZnVsY3I6c2VjcmV0LXRva2Vu").as_deref(),
+            Some("secret-token")
+        );
+        assert!(presented_token("Basic not-base64").is_none());
+    }
+
+    #[tokio::test]
+    async fn external_vex_resolution_is_opt_in_and_fixed_is_machine_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("external".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+        let state = AppState {
+            store,
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+
+        let disabled = match add_vex(
+            Path(recipe.id),
+            State(state.clone()),
+            Json(external_vex_input(
+                &recipe,
+                crate::models::VexStatus::NotAffected,
+            )),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("external VEX should be disabled"),
+        };
+        assert!(matches!(disabled, AppError::BadRequest(message) if message.contains("disabled")));
+
+        let fixed = match add_vex(
+            Path(recipe.id),
+            State(state),
+            Json(external_vex_input(&recipe, crate::models::VexStatus::Fixed)),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("external fixed VEX should be rejected"),
+        };
+        assert!(
+            matches!(fixed, AppError::BadRequest(message) if message.contains("derives fixed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_external_vex_requires_and_persists_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let policy = crate::models::RetentionPolicy {
+            allow_external_vex_overrides: true,
+            ..Default::default()
+        };
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("external".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy,
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+        store
+            .save_build(&external_vex_build(&recipe))
+            .await
+            .unwrap();
+        let state = AppState {
+            store,
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+        let mut incomplete = external_vex_input(&recipe, crate::models::VexStatus::NotAffected);
+        incomplete.author = None;
+        let error = match add_vex(Path(recipe.id), State(state.clone()), Json(incomplete)).await {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete external VEX should be rejected"),
+        };
+        assert!(matches!(error, AppError::BadRequest(message) if message.contains("requires")));
+
+        let mut wrong_subject = external_vex_input(&recipe, crate::models::VexStatus::NotAffected);
+        wrong_subject.product = Some(format!("urn:oci:blob:sha256:{}", "e".repeat(64)));
+        let error = match add_vex(Path(recipe.id), State(state.clone()), Json(wrong_subject)).await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("wrong-subject external VEX should be rejected"),
+        };
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("product must equal"))
+        );
+
+        let mut expired = external_vex_input(&recipe, crate::models::VexStatus::NotAffected);
+        expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+        let error = match add_vex(Path(recipe.id), State(state.clone()), Json(expired)).await {
+            Err(error) => error,
+            Ok(_) => panic!("expired external VEX should be rejected"),
+        };
+        assert!(matches!(error, AppError::BadRequest(message) if message.contains("future")));
+
+        let _ = add_vex(
+            Path(recipe.id),
+            State(state.clone()),
+            Json(external_vex_input(
+                &recipe,
+                crate::models::VexStatus::NotAffected,
+            )),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let statements = state.store.list_vex(recipe.id).await.unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].author.as_deref(),
+            Some("security@example.invalid")
+        );
+    }
+
+    fn external_vex_input(recipe: &Recipe, status: crate::models::VexStatus) -> VexInput {
+        VexInput {
+            vulnerability: "CVE-2026-0001".to_string(),
+            status,
+            recipe_digest: Some(recipe.digest.clone()),
+            product: Some(format!("urn:oci:blob:sha256:{}", "d".repeat(64))),
+            component: Some("openssl".to_string()),
+            justification: Some("vulnerable_code_not_present".to_string()),
+            detail: Some("Administrative exception backed by external evidence".to_string()),
+            author: Some("security@example.invalid".to_string()),
+            expires_at: Some("2999-01-01T00:00:00Z".to_string()),
+        }
+    }
+
+    fn external_vex_build(recipe: &Recipe) -> BuildRecord {
+        let digest = format!("sha256:{}", "d".repeat(64));
+        BuildRecord {
+            id: Uuid::new_v4(),
+            recipe_id: recipe.id,
+            recipe_digest: recipe.digest.clone(),
+            source_scan_id: Some(Uuid::new_v4()),
+            source_scan_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            artifact_scan_id: None,
+            policy_decision: None,
+            status: BuildStatus::Succeeded,
+            created_at: timestamp(),
+            started_at: Some(timestamp()),
+            finished_at: Some(timestamp()),
+            command: Vec::new(),
+            working_dir: None,
+            exit_code: None,
+            artifact: Some(ArtifactRef {
+                digest: digest.clone(),
+                diff_id: Some(digest),
+                media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                size: 1024,
+                retained: true,
+                path: None,
+                expires_at: None,
+            }),
+            stdout_tail: None,
+            stderr_tail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_uses_oci_error_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Store::open(temp.path()).await.unwrap(),
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+
+        let response =
+            oci_distribution_response("missing/manifests/latest".to_string(), state, true)
+                .await
+                .unwrap_err()
+                .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["errors"][0]["code"], "MANIFEST_UNKNOWN");
+        assert!(body.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn oci_empty_config_descriptor_resolves_to_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Store::open(temp.path()).await.unwrap(),
+            work_dir: temp.path().to_path_buf(),
+            auth_token: None,
+        };
+        let digest = digest_bytes(OCI_EMPTY_CONFIG_BYTES);
+
+        let response = oci_blob_response("any/repository".to_string(), digest.clone(), state, true)
+            .await
+            .unwrap();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(headers[header::CONTENT_TYPE], OCI_EMPTY_CONFIG_MEDIA_TYPE);
+        assert_eq!(headers["Docker-Content-Digest"], digest);
+        assert_eq!(&bytes[..], OCI_EMPTY_CONFIG_BYTES);
     }
 
     #[tokio::test]
@@ -438,6 +718,10 @@ mod tests {
                 id: Uuid::new_v4(),
                 recipe_id: recipe.id,
                 recipe_digest: recipe.digest.clone(),
+                source_scan_id: None,
+                source_scan_digest: None,
+                artifact_scan_id: None,
+                policy_decision: None,
                 status: BuildStatus::Succeeded,
                 created_at: timestamp(),
                 started_at: Some(timestamp()),
@@ -451,12 +735,11 @@ mod tests {
                     media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
                     size: bytes.len() as u64,
                     retained: true,
-                    path: Some(cache_path),
+                    path: Some(cache_path.clone()),
                     expires_at: None,
                 }),
                 stdout_tail: None,
                 stderr_tail: None,
-                security_anomalies: Vec::new(),
                 notes: Vec::new(),
             })
             .await
@@ -474,26 +757,6 @@ mod tests {
             }
             other => panic!("expected forbidden blob response, got {other:?}"),
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn execute_native_caps_stdout() {
-        let command = format!("printf '%*s' {} ''", BUILD_OUTPUT_LIMIT_BYTES + 1024);
-        let (exit_code, stdout, stderr, anomalies) = execute_native(
-            vec!["/bin/sh".to_string(), "-c".to_string(), command],
-            Vec::new(),
-            ".",
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(exit_code, 0);
-        assert_eq!(stdout.len(), BUILD_OUTPUT_LIMIT_BYTES);
-        assert!(String::from_utf8_lossy(&stderr).contains("stdout exceeded output capture limit"));
-        assert!(anomalies.is_empty());
     }
 
     #[tokio::test]
@@ -550,9 +813,454 @@ mod tests {
 
         assert!(artifact.is_none());
         assert!(matches!(status, BuildStatus::Failed));
-        assert!(notes
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("not a valid uncompressed OCI layer tar"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_build_imports_artifact_without_running_recipe_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        tokio::fs::write(work_dir.join("layer.tar"), fixture_layer_bytes())
+            .await
+            .unwrap();
+        let store = Store::open(work_dir.join("store")).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(work_dir.clone()),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "touch command-was-run".to_string(),
+                ],
+                artifact: Some(PathBuf::from("layer.tar")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        let state = AppState {
+            store,
+            work_dir: work_dir.clone(),
+            auth_token: None,
+        };
+
+        let record = execute_build(
+            &state,
+            &recipe,
+            BuildRequest {
+                execute: true,
+                cache_artifact: true,
+                environment: Default::default(),
+                osv_mode: crate::models::OsvMode::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(record.status, BuildStatus::Succeeded));
+        assert!(!work_dir.join("command-was-run").exists());
+        assert!(record.command.is_empty());
+        let artifact = record.artifact.unwrap();
+        assert!(
+            artifact
+                .path
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_ingestion_rejects_existing_cas_digest_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let layer_bytes = fixture_layer_bytes();
+        tokio::fs::write(work_dir.join("layer.tar"), &layer_bytes)
+            .await
+            .unwrap();
+        let store = Store::open(work_dir.join("store")).await.unwrap();
+        let digest = digest_bytes(&layer_bytes);
+        let cache_path = store.cache_dir().join(cache_file_name(&digest));
+        let mut different_bytes = layer_bytes.clone();
+        let payload_offset = different_bytes
+            .windows(b"hello".len())
+            .position(|window| window == b"hello")
+            .unwrap();
+        different_bytes[payload_offset] = b'j';
+        tokio::fs::write(&cache_path, &different_bytes)
+            .await
+            .unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(work_dir.clone()),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                artifact: Some(PathBuf::from("layer.tar")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        let state = AppState {
+            store,
+            work_dir: work_dir.clone(),
+            auth_token: None,
+        };
+
+        let error = execute_build(
+            &state,
+            &recipe,
+            BuildRequest {
+                execute: true,
+                cache_artifact: true,
+                environment: Default::default(),
+                osv_mode: crate::models::OsvMode::Disabled,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::Internal(_)));
+        assert_eq!(tokio::fs::read(cache_path).await.unwrap(), different_bytes);
+        assert!(
+            !work_dir
+                .join("store/cache")
+                .read_dir()
+                .unwrap()
+                .any(|entry| {
+                    entry.ok().is_some_and(|entry| {
+                        entry.file_name().to_string_lossy().starts_with(".ingest-")
+                    })
+                })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_layer_selection_rejects_same_size_cas_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let layer_bytes = fixture_layer_bytes();
+        tokio::fs::write(work_dir.join("layer.tar"), &layer_bytes)
+            .await
+            .unwrap();
+        let store = Store::open(work_dir.join("store")).await.unwrap();
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(work_dir.clone()),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("external".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                artifact: Some(PathBuf::from("layer.tar")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        let state = AppState {
+            store,
+            work_dir,
+            auth_token: None,
+        };
+        let record = execute_build(
+            &state,
+            &recipe,
+            BuildRequest {
+                execute: true,
+                cache_artifact: true,
+                environment: Default::default(),
+                osv_mode: crate::models::OsvMode::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+        state.store.save_build(&record).await.unwrap();
+        let artifact = record.artifact.unwrap();
+        let cache_path = artifact.path.unwrap();
+        let mut permissions = std::fs::metadata(&cache_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&cache_path, permissions).unwrap();
+        let mut mutated = layer_bytes;
+        let offset = mutated
+            .windows(b"hello".len())
+            .position(|window| window == b"hello")
+            .unwrap();
+        mutated[offset] = b'j';
+        tokio::fs::write(&cache_path, mutated).await.unwrap();
+
+        let error = latest_materialized_layer(&state, &recipe)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Forbidden(message) if message.contains("digest mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn build_import_retries_after_failure_and_binds_fresh_scans() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let source_dir = work_dir.join("source");
+        tokio::fs::create_dir(&source_dir).await.unwrap();
+        tokio::fs::write(source_dir.join("layer.tar"), b"not a layer")
+            .await
+            .unwrap();
+        let store = Store::open(work_dir.join("store")).await.unwrap();
+        let policy = crate::models::RetentionPolicy {
+            require_osv: false,
+            retain_artifact: true,
+            ..Default::default()
+        };
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(source_dir.clone()),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("external".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: crate::models::BuildSpec {
+                artifact: Some(PathBuf::from("layer.tar")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy,
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+        let state = AppState {
+            store,
+            work_dir,
+            auth_token: None,
+        };
+        let request = BuildRequest {
+            execute: true,
+            cache_artifact: true,
+            environment: Default::default(),
+            osv_mode: crate::models::OsvMode::Disabled,
+        };
+
+        let _ = create_build(Path(recipe.id), State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap()
+            .into_response();
+        assert!(matches!(
+            state.store.list_builds(recipe.id).await.unwrap()[0].status,
+            BuildStatus::Failed
+        ));
+
+        tokio::fs::write(source_dir.join("layer.tar"), fixture_layer_bytes())
+            .await
+            .unwrap();
+        let _ = create_build(Path(recipe.id), State(state.clone()), Json(request))
+            .await
+            .unwrap()
+            .into_response();
+
+        let builds = state.store.list_builds(recipe.id).await.unwrap();
+        let successful = builds.last().unwrap();
+        assert!(matches!(successful.status, BuildStatus::Succeeded));
+        assert!(successful.source_scan_id.is_some());
+        assert!(successful.source_scan_digest.is_some());
+        assert_eq!(
+            successful
+                .policy_decision
+                .as_ref()
+                .map(|decision| &decision.outcome),
+            Some(&GateOutcome::Allowed)
+        );
+        let latest_scan = state.store.latest_scan(recipe.id).await.unwrap().unwrap();
+        assert!(latest_scan.image.as_ref().is_some_and(|image| {
+            image.layers.iter().any(|layer| {
+                successful
+                    .artifact
+                    .as_ref()
+                    .is_some_and(|artifact| layer.digest == artifact.digest)
+            })
+        }));
+        assert_eq!(successful.artifact_scan_id, Some(latest_scan.id));
+        let mut later_source_scan = state
+            .store
+            .get_scan(recipe.id, successful.source_scan_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        later_source_scan.id = Uuid::new_v4();
+        later_source_scan.created_at = timestamp();
+        state.store.save_scan(&later_source_scan).await.unwrap();
+        let decision_scan = load_decision_scan(&state, recipe.id, Some(successful))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision_scan.id, latest_scan.id);
+        assert_eq!(
+            metadata_gate(&state, &recipe).await.unwrap().outcome,
+            GateOutcome::Allowed
+        );
+
+        let source_scan_id = successful.source_scan_id.unwrap();
+        let mut source_scan = state
+            .store
+            .get_scan(recipe.id, source_scan_id)
+            .await
+            .unwrap()
+            .unwrap();
+        source_scan.scanner = "tampered-scanner".to_string();
+        state.store.save_scan(&source_scan).await.unwrap();
+        let decision = metadata_gate(&state, &recipe).await.unwrap();
+        assert_eq!(decision.outcome, GateOutcome::Denied);
+        assert!(decision
+            .reasons
             .iter()
-            .any(|note| note.contains("not a valid uncompressed OCI layer tar")));
+            .any(|reason| reason.contains("source scan binding") && reason.contains("mismatch")));
+        let slsa =
+            verified_slsa_provenance_document(&state, &recipe, &builds, Some(&latest_scan), &[])
+                .await
+                .unwrap();
+        assert_eq!(
+            slsa["predicate"]["runDetails"]["metadata"]["fulcrSlsaPolicy"]["outcome"],
+            "denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_artifact_intake_persists_failed_policy_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let source_dir = work_dir.join("source");
+        tokio::fs::create_dir(&source_dir).await.unwrap();
+        tokio::fs::write(
+            source_dir.join("developer.key"),
+            "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n",
+        )
+        .await
+        .unwrap();
+        let store = Store::open(work_dir.join("store")).await.unwrap();
+        let policy = crate::models::RetentionPolicy {
+            require_osv: false,
+            retain_artifact: true,
+            ..Default::default()
+        };
+        let recipe = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                path: Some(source_dir),
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("external".to_string()),
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+            },
+            build: crate::models::BuildSpec {
+                artifact: Some(PathBuf::from("layer.tar")),
+                ..Default::default()
+            },
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy,
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&recipe).await.unwrap();
+        let state = AppState {
+            store,
+            work_dir,
+            auth_token: None,
+        };
+
+        let error = match create_build(
+            Path(recipe.id),
+            State(state.clone()),
+            Json(BuildRequest {
+                execute: true,
+                cache_artifact: true,
+                environment: Default::default(),
+                osv_mode: crate::models::OsvMode::Disabled,
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("private key source should deny artifact intake"),
+        };
+        assert!(
+            matches!(error, AppError::Forbidden(message) if message.contains("denied artifact intake"))
+        );
+
+        let builds = state.store.list_builds(recipe.id).await.unwrap();
+        assert_eq!(builds.len(), 1);
+        assert!(matches!(builds[0].status, BuildStatus::Failed));
+        assert!(builds[0].source_scan_id.is_some());
+        assert_eq!(
+            builds[0]
+                .policy_decision
+                .as_ref()
+                .map(|decision| &decision.outcome),
+            Some(&GateOutcome::Denied)
+        );
     }
 
     #[tokio::test]
@@ -628,10 +1336,48 @@ mod tests {
         assert!(error.contains("does not match blob digest"));
     }
 
+    #[test]
+    fn artifact_expiry_is_enforced_fail_closed() {
+        assert!(artifact_is_expired("2000-01-01T00:00:00Z").unwrap());
+        assert!(!artifact_is_expired("2999-01-01T00:00:00Z").unwrap());
+        assert!(artifact_is_expired("not-a-timestamp").is_err());
+    }
+
     #[tokio::test]
     async fn metadata_documents_are_served_by_digest() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).await.unwrap();
+        let unmaterialized = Recipe::new(RecipeInput {
+            name: "service".to_string(),
+            source: crate::models::SourceRef {
+                repo: "https://example.invalid/service".to_string(),
+                revision: "ffffffffffffffffffffffffffffffffffffffff".to_string(),
+                path: None,
+            },
+            builder: crate::models::BuilderRef {
+                kind: crate::models::BuilderKind::Script,
+                name: Some("local".to_string()),
+                digest: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+            },
+            build: Default::default(),
+            materials: Vec::new(),
+            crypto: Vec::new(),
+            policy: Default::default(),
+            annotations: Default::default(),
+        })
+        .unwrap();
+        store.save_recipe(&unmaterialized).await.unwrap();
+        let corrupt_scan_dir = temp
+            .path()
+            .join("scans")
+            .join(unmaterialized.id.to_string());
+        tokio::fs::create_dir_all(&corrupt_scan_dir).await.unwrap();
+        tokio::fs::write(corrupt_scan_dir.join("corrupt.json"), b"not-json")
+            .await
+            .unwrap();
         let recipe = Recipe::new(RecipeInput {
             name: "service".to_string(),
             source: crate::models::SourceRef {
@@ -655,14 +1401,88 @@ mod tests {
         })
         .unwrap();
         store.save_recipe(&recipe).await.unwrap();
+        let bytes = fixture_layer_bytes();
+        let digest = digest_bytes(&bytes);
+        let cache_path = store.cache_dir().join(cache_file_name(&digest));
+        tokio::fs::write(&cache_path, &bytes).await.unwrap();
+        let (source_scan_id, source_scan_digest) =
+            save_fixture_source_scan(&store, &recipe, temp.path()).await;
+        store
+            .save_build(&BuildRecord {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                source_scan_id: Some(source_scan_id),
+                source_scan_digest: Some(source_scan_digest),
+                artifact_scan_id: None,
+                policy_decision: None,
+                status: BuildStatus::Succeeded,
+                created_at: timestamp(),
+                started_at: Some(timestamp()),
+                finished_at: Some(timestamp()),
+                command: Vec::new(),
+                working_dir: None,
+                exit_code: None,
+                artifact: Some(ArtifactRef {
+                    digest: digest.clone(),
+                    diff_id: Some(digest.clone()),
+                    media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                    size: bytes.len() as u64,
+                    retained: true,
+                    path: Some(cache_path.clone()),
+                    expires_at: None,
+                }),
+                stdout_tail: None,
+                stderr_tail: None,
+                notes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .save_scan(&ScanReport {
+                id: Uuid::new_v4(),
+                recipe_id: recipe.id,
+                recipe_digest: recipe.digest.clone(),
+                created_at: timestamp(),
+                scanner: "test".to_string(),
+                filesystem_digest: None,
+                declared_artifact_digest: None,
+                mode: crate::models::ScanMode::Filesystem,
+                root: temp.path().to_path_buf(),
+                image: Some(crate::models::ImageScanMetadata {
+                    kind: "oci-layer-artifact".to_string(),
+                    archive: cache_path,
+                    manifest_digest: None,
+                    config_digest: None,
+                    tags: Vec::new(),
+                    layers: vec![crate::models::ImageLayerMetadata {
+                        digest: digest.clone(),
+                        diff_id: Some(digest),
+                        media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                        size: bytes.len() as u64,
+                    }],
+                }),
+                status: crate::models::ScanStatus::Completed,
+                summary: crate::models::ScanSummary::default(),
+                components: Vec::new(),
+                crypto: Vec::new(),
+                binaries: Vec::new(),
+                findings: Vec::new(),
+                vulnerability_assessments: Vec::new(),
+                sbom: crate::metadata::sbom_document(&recipe),
+                cbom: crate::metadata::cbom_document(&recipe),
+            })
+            .await
+            .unwrap();
         let state = AppState {
             store,
             work_dir: temp.path().to_path_buf(),
             auth_token: None,
         };
+        let image_manifest = materialized_image_manifest(&state, &recipe).await.unwrap();
         let referrers_response = oci_referrers_response(
             "service".to_string(),
-            recipe.digest.clone(),
+            image_manifest.digest.clone(),
             state.clone(),
             true,
         )
@@ -672,7 +1492,7 @@ mod tests {
 
         let head_response = oci_referrers_response(
             "service".to_string(),
-            recipe.digest.clone(),
+            image_manifest.digest.clone(),
             state.clone(),
             false,
         )
@@ -680,13 +1500,24 @@ mod tests {
         .unwrap();
         assert_eq!(head_response.status(), StatusCode::OK);
 
-        let recipe_subject = MetadataSubject::recipe(&recipe);
-        let document = metadata_documents(&state, &recipe, &recipe_subject)
+        let image_subject = MetadataSubject::image(&image_manifest);
+        let document = metadata_documents(&state, &recipe, &image_subject)
             .await
             .unwrap()
             .into_iter()
             .find(|document| document.title == "sbom")
             .unwrap();
+        let artifact_manifest: serde_json::Value =
+            serde_json::from_slice(&document.manifest_bytes).unwrap();
+        assert_eq!(
+            artifact_manifest["mediaType"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            artifact_manifest["config"]["mediaType"],
+            OCI_EMPTY_CONFIG_MEDIA_TYPE
+        );
+        assert!(artifact_manifest["layers"].is_array());
 
         let manifest_response = oci_manifest_response(
             "service".to_string(),
@@ -738,11 +1569,17 @@ mod tests {
         let digest = digest_bytes(&bytes);
         let cache_path = store.cache_dir().join(cache_file_name(&digest));
         tokio::fs::write(&cache_path, &bytes).await.unwrap();
+        let (source_scan_id, source_scan_digest) =
+            save_fixture_source_scan(&store, &recipe, temp.path()).await;
         store
             .save_build(&BuildRecord {
                 id: Uuid::new_v4(),
                 recipe_id: recipe.id,
                 recipe_digest: recipe.digest.clone(),
+                source_scan_id: Some(source_scan_id),
+                source_scan_digest: Some(source_scan_digest),
+                artifact_scan_id: None,
+                policy_decision: None,
                 status: BuildStatus::Succeeded,
                 created_at: timestamp(),
                 started_at: Some(timestamp()),
@@ -756,12 +1593,11 @@ mod tests {
                     media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
                     size: bytes.len() as u64,
                     retained: true,
-                    path: Some(cache_path),
+                    path: Some(cache_path.clone()),
                     expires_at: None,
                 }),
                 stdout_tail: None,
                 stderr_tail: None,
-                security_anomalies: Vec::new(),
                 notes: Vec::new(),
             })
             .await
@@ -773,16 +1609,30 @@ mod tests {
                 recipe_digest: recipe.digest.clone(),
                 created_at: timestamp(),
                 scanner: "test".to_string(),
-                mode: crate::models::ScanMode::Source,
+                filesystem_digest: None,
+                declared_artifact_digest: None,
+                mode: crate::models::ScanMode::Filesystem,
                 root: temp.path().to_path_buf(),
-                image: None,
+                image: Some(crate::models::ImageScanMetadata {
+                    kind: "oci-layer-artifact".to_string(),
+                    archive: cache_path,
+                    manifest_digest: None,
+                    config_digest: None,
+                    tags: Vec::new(),
+                    layers: vec![crate::models::ImageLayerMetadata {
+                        digest: digest.clone(),
+                        diff_id: Some(digest),
+                        media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                        size: bytes.len() as u64,
+                    }],
+                }),
                 status: crate::models::ScanStatus::Completed,
                 summary: crate::models::ScanSummary::default(),
                 components: Vec::new(),
                 crypto: Vec::new(),
                 binaries: Vec::new(),
                 findings: Vec::new(),
-                vex_candidates: Vec::new(),
+                vulnerability_assessments: Vec::new(),
                 sbom: crate::metadata::sbom_document(&recipe),
                 cbom: crate::metadata::cbom_document(&recipe),
             })
@@ -891,6 +1741,8 @@ mod tests {
                 recipe_digest: recipe.digest.clone(),
                 created_at: timestamp(),
                 scanner: "test".to_string(),
+                filesystem_digest: None,
+                declared_artifact_digest: None,
                 mode: crate::models::ScanMode::Source,
                 root: work_dir.clone(),
                 image: None,
@@ -900,7 +1752,7 @@ mod tests {
                 crypto: Vec::new(),
                 binaries: Vec::new(),
                 findings: Vec::new(),
-                vex_candidates: Vec::new(),
+                vulnerability_assessments: Vec::new(),
                 sbom: crate::metadata::sbom_document(&recipe),
                 cbom: crate::metadata::cbom_document(&recipe),
             })
@@ -928,11 +1780,13 @@ mod tests {
 
         let builds = state.store.list_builds(recipe.id).await.unwrap();
         assert!(builds.is_empty());
-        assert!(!state
-            .store
-            .cache_dir()
-            .join(cache_file_name(&digest_bytes(&layer_bytes)))
-            .exists());
+        assert!(
+            !state
+                .store
+                .cache_dir()
+                .join(cache_file_name(&digest_bytes(&layer_bytes)))
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -967,11 +1821,17 @@ mod tests {
         let digest = digest_bytes(&bytes);
         let cache_path = store.cache_dir().join(cache_file_name(&digest));
         tokio::fs::write(&cache_path, &bytes).await.unwrap();
+        let (source_scan_id, source_scan_digest) =
+            save_fixture_source_scan(&store, &recipe, temp.path()).await;
         store
             .save_build(&BuildRecord {
                 id: Uuid::new_v4(),
                 recipe_id: recipe.id,
                 recipe_digest: recipe.digest.clone(),
+                source_scan_id: Some(source_scan_id),
+                source_scan_digest: Some(source_scan_digest),
+                artifact_scan_id: None,
+                policy_decision: None,
                 status: BuildStatus::Succeeded,
                 created_at: timestamp(),
                 started_at: Some(timestamp()),
@@ -985,12 +1845,11 @@ mod tests {
                     media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
                     size: bytes.len() as u64,
                     retained: true,
-                    path: Some(cache_path),
+                    path: Some(cache_path.clone()),
                     expires_at: None,
                 }),
                 stdout_tail: None,
                 stderr_tail: None,
-                security_anomalies: Vec::new(),
                 notes: Vec::new(),
             })
             .await
@@ -1006,16 +1865,30 @@ mod tests {
                 recipe_digest: recipe.digest.clone(),
                 created_at: timestamp(),
                 scanner: "test".to_string(),
-                mode: crate::models::ScanMode::Source,
+                filesystem_digest: None,
+                declared_artifact_digest: None,
+                mode: crate::models::ScanMode::Filesystem,
                 root: temp.path().to_path_buf(),
-                image: None,
+                image: Some(crate::models::ImageScanMetadata {
+                    kind: "oci-layer-artifact".to_string(),
+                    archive: cache_path,
+                    manifest_digest: None,
+                    config_digest: None,
+                    tags: Vec::new(),
+                    layers: vec![crate::models::ImageLayerMetadata {
+                        digest: digest.clone(),
+                        diff_id: Some(digest),
+                        media_type: Some(OCI_LAYER_MEDIA_TYPE.to_string()),
+                        size: bytes.len() as u64,
+                    }],
+                }),
                 status: crate::models::ScanStatus::Completed,
                 summary: crate::models::ScanSummary::default(),
                 components: Vec::new(),
                 crypto: Vec::new(),
                 binaries: Vec::new(),
                 findings: Vec::new(),
-                vex_candidates: Vec::new(),
+                vulnerability_assessments: Vec::new(),
                 sbom: crate::metadata::sbom_document(&recipe),
                 cbom: crate::metadata::cbom_document(&recipe),
             })
@@ -1089,6 +1962,37 @@ mod tests {
         assert_eq!(resolved, work_dir.join("checkout/service"));
     }
 
+    async fn save_fixture_source_scan(
+        store: &Store,
+        recipe: &Recipe,
+        root: &std::path::Path,
+    ) -> (Uuid, String) {
+        let scan = ScanReport {
+            id: Uuid::new_v4(),
+            recipe_id: recipe.id,
+            recipe_digest: recipe.digest.clone(),
+            created_at: timestamp(),
+            scanner: "test-source-scanner".to_string(),
+            filesystem_digest: Some(digest_bytes(&[])),
+            declared_artifact_digest: None,
+            mode: crate::models::ScanMode::Source,
+            root: root.to_path_buf(),
+            image: None,
+            status: crate::models::ScanStatus::Completed,
+            summary: crate::models::ScanSummary::default(),
+            components: Vec::new(),
+            crypto: Vec::new(),
+            binaries: Vec::new(),
+            findings: Vec::new(),
+            vulnerability_assessments: Vec::new(),
+            sbom: crate::metadata::sbom_document(recipe),
+            cbom: crate::metadata::cbom_document(recipe),
+        };
+        let digest = scan_evidence_digest(&scan).unwrap();
+        store.save_scan(&scan).await.unwrap();
+        (scan.id, digest)
+    }
+
     fn fixture_layer_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
         {
@@ -1119,15 +2023,15 @@ async fn create_recipe(
     if input.source.revision.trim().is_empty() {
         return Err(AppError::bad_request("source revision must not be empty"));
     }
-    if input.build.run_command.is_some() {
-        return Err(AppError::bad_request(
-            "build.run_command requires an enforced native sandbox and is not supported yet",
-        ));
-    }
-
-    let recipe = Recipe::new(input)?;
-    state.store.save_recipe(&recipe).await?;
-    Ok((StatusCode::CREATED, Json(recipe)))
+    let proposed = Recipe::new(input)?;
+    let proposed_id = proposed.id;
+    let recipe = state.store.save_recipe(&proposed).await?;
+    let status = if recipe.id == proposed_id {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(recipe)))
 }
 
 async fn get_recipe(
@@ -1151,14 +2055,128 @@ async fn create_build(
     Json(request): Json<BuildRequest>,
 ) -> AppResult<impl IntoResponse> {
     let recipe = load_recipe(&state, id).await?;
-    let record = if request.execute {
-        enforce_build_gate(&state, &recipe).await?;
-        execute_build(&state, &recipe, request).await?
+    let osv_mode = request.osv_mode.clone();
+    let mut source_scan_for_assessment = None;
+    let mut record = if request.execute {
+        let excluded_roots = [state.store.data_dir().to_path_buf()];
+        let source_scan = scanner::scan_recipe_excluding(
+            &recipe,
+            ScanRequest {
+                mode: crate::models::ScanMode::Source,
+                path: None,
+                max_file_bytes: None,
+                osv_mode: osv_mode.clone(),
+            },
+            &state.work_dir,
+            &excluded_roots,
+        )
+        .await?;
+        state.store.save_scan(&source_scan).await?;
+        let intake_decision = gate::evaluate_artifact_intake_gate(&recipe, &source_scan);
+        if intake_decision.outcome == GateOutcome::Denied {
+            let source_scan_digest = scan_evidence_digest(&source_scan)?;
+            state
+                .store
+                .save_build(&BuildRecord {
+                    id: Uuid::new_v4(),
+                    recipe_id: recipe.id,
+                    recipe_digest: recipe.digest.clone(),
+                    source_scan_id: Some(source_scan.id),
+                    source_scan_digest: Some(source_scan_digest),
+                    artifact_scan_id: None,
+                    policy_decision: Some(intake_decision.clone()),
+                    status: BuildStatus::Failed,
+                    created_at: timestamp(),
+                    started_at: Some(timestamp()),
+                    finished_at: Some(timestamp()),
+                    command: Vec::new(),
+                    working_dir: None,
+                    exit_code: None,
+                    artifact: None,
+                    stdout_tail: None,
+                    stderr_tail: None,
+                    notes: vec!["autonomous source policy denied artifact intake".to_string()],
+                })
+                .await?;
+            return Err(AppError::forbidden(format!(
+                "metadata gate denied artifact intake: {}",
+                intake_decision.reasons.join("; ")
+            )));
+        }
+        let mut record = execute_build(&state, &recipe, request).await?;
+        if matches!(record.status, BuildStatus::Succeeded) {
+            let imported_artifact_digest = record
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.digest.as_str())
+                .ok_or_else(|| AppError::forbidden("successful import lacks artifact evidence"))?;
+            let scanned_artifact_digest = source_scan
+                .declared_artifact_digest
+                .as_deref()
+                .ok_or_else(|| {
+                    AppError::forbidden(
+                        "fresh source scan did not fingerprint the declared artifact path",
+                    )
+                })?;
+            if imported_artifact_digest != scanned_artifact_digest {
+                return Err(AppError::forbidden(format!(
+                    "imported artifact digest does not match fresh source scan: expected {}, found {}",
+                    scanned_artifact_digest, imported_artifact_digest
+                )));
+            }
+            let expected_source_digest =
+                source_scan.filesystem_digest.as_deref().ok_or_else(|| {
+                    AppError::forbidden("fresh source scan lacks a filesystem digest")
+                })?;
+            let actual_source_digest = scanner::source_filesystem_digest_excluding(
+                &recipe,
+                &state.work_dir,
+                &excluded_roots,
+            )
+            .await?;
+            if actual_source_digest != expected_source_digest {
+                return Err(AppError::forbidden(format!(
+                    "source tree changed during artifact ingestion: expected {}, found {}",
+                    expected_source_digest, actual_source_digest
+                )));
+            }
+        }
+        record.source_scan_id = Some(source_scan.id);
+        record.source_scan_digest = Some(scan_evidence_digest(&source_scan)?);
+        source_scan_for_assessment = Some(source_scan);
+        record
     } else {
         BuildRecord::planned(&recipe)
     };
 
-    state.store.save_build(&record).await?;
+    let artifact_scan = if let Some(artifact) = record
+        .artifact
+        .as_ref()
+        .filter(|artifact| artifact.retained && matches!(record.status, BuildStatus::Succeeded))
+    {
+        let mut scan = scanner::scan_layer_artifact(&recipe, artifact, osv_mode).await?;
+        if let Some(source_scan) = source_scan_for_assessment.as_ref() {
+            scanner::apply_autonomous_vex_assessments(source_scan, &mut scan);
+        }
+        Some(scan)
+    } else {
+        None
+    };
+    if let Some(scan) = artifact_scan.as_ref() {
+        record.artifact_scan_id = Some(scan.id);
+        let external_vex = state.store.list_vex(recipe.id).await?;
+        record.policy_decision = Some(gate::evaluate_gate(
+            &recipe,
+            Some(&record),
+            Some(scan),
+            &external_vex,
+        ));
+    }
+    if let Some(scan) = artifact_scan.as_ref() {
+        state.store.save_build_with_scan(&record, scan).await?;
+    } else {
+        state.store.save_build(&record).await?;
+    }
     Ok((StatusCode::CREATED, Json(record)))
 }
 
@@ -1211,7 +2229,9 @@ async fn create_scan(
     Json(request): Json<ScanRequest>,
 ) -> AppResult<impl IntoResponse> {
     let recipe = load_recipe(&state, id).await?;
-    let scan = scanner::scan_recipe(&recipe, request, &state.work_dir).await?;
+    let excluded_roots = [state.store.data_dir().to_path_buf()];
+    let scan =
+        scanner::scan_recipe_excluding(&recipe, request, &state.work_dir, &excluded_roots).await?;
     state.store.save_scan(&scan).await?;
     Ok((StatusCode::CREATED, Json(scan)))
 }
@@ -1221,15 +2241,7 @@ async fn get_gate(
     State(state): State<AppState>,
 ) -> AppResult<Json<GateDecision>> {
     let recipe = load_recipe(&state, id).await?;
-    let builds = state.store.list_builds(id).await?;
-    let latest_scan = state.store.latest_scan(id).await?;
-    let vex = state.store.list_vex(id).await?;
-    Ok(Json(gate::evaluate_gate(
-        &recipe,
-        latest_build_evidence(&builds),
-        latest_scan.as_ref(),
-        &vex,
-    )))
+    Ok(Json(metadata_gate(&state, &recipe).await?))
 }
 
 async fn add_vex(
@@ -1240,6 +2252,60 @@ async fn add_vex(
     let recipe = load_recipe(&state, id).await?;
     if input.vulnerability.trim().is_empty() {
         return Err(AppError::bad_request("vulnerability must not be empty"));
+    }
+    match input.status {
+        crate::models::VexStatus::Fixed => {
+            return Err(AppError::bad_request(
+                "external fixed VEX is not accepted; Fulcr derives fixed status from exact artifact version and OSV evidence",
+            ));
+        }
+        crate::models::VexStatus::NotAffected => {
+            if !recipe.policy.allow_external_vex_overrides {
+                return Err(AppError::bad_request(
+                    "external not_affected VEX overrides are disabled by recipe policy",
+                ));
+            }
+            if input.component.as_deref().is_none_or(str::is_empty)
+                || input.justification.as_deref().is_none_or(str::is_empty)
+                || input.detail.as_deref().is_none_or(str::is_empty)
+                || input.author.as_deref().is_none_or(str::is_empty)
+                || input.product.as_deref().is_none_or(str::is_empty)
+                || input.expires_at.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(AppError::bad_request(
+                    "external not_affected VEX requires exact artifact product, component, justification, detail, author, and expires_at",
+                ));
+            }
+            let expires_at = input.expires_at.as_deref().unwrap_or_default();
+            match artifact_is_expired(expires_at) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(AppError::bad_request(
+                        "external not_affected VEX expires_at must be in the future",
+                    ));
+                }
+                Err(error) => {
+                    return Err(AppError::bad_request(format!(
+                        "external not_affected VEX has invalid expires_at: {error}"
+                    )));
+                }
+            }
+            let builds = state.store.list_builds(id).await?;
+            let expected_product = latest_build_evidence(&builds)
+                .and_then(|build| build.artifact.as_ref())
+                .map(|artifact| format!("urn:oci:blob:{}", artifact.digest))
+                .ok_or_else(|| {
+                    AppError::bad_request(
+                        "external not_affected VEX requires a current retained artifact",
+                    )
+                })?;
+            if input.product.as_deref() != Some(expected_product.as_str()) {
+                return Err(AppError::bad_request(format!(
+                    "external not_affected VEX product must equal {expected_product}"
+                )));
+            }
+        }
+        crate::models::VexStatus::Affected | crate::models::VexStatus::UnderInvestigation => {}
     }
     match input.recipe_digest.as_deref() {
         Some(declared) if declared == recipe.digest => {}
@@ -1264,8 +2330,15 @@ async fn get_vex(
     Path(id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<VexStatement>>> {
-    load_recipe(&state, id).await?;
-    Ok(Json(state.store.list_vex(id).await?))
+    let recipe = load_recipe(&state, id).await?;
+    let builds = state.store.list_builds(id).await?;
+    let decision_scan = load_decision_scan(&state, id, latest_build_evidence(&builds)).await?;
+    let external = state.store.list_vex(id).await?;
+    Ok(Json(combined_vex_statements(
+        &recipe,
+        decision_scan.as_ref(),
+        &external,
+    )))
 }
 
 async fn get_openvex(
@@ -1273,7 +2346,10 @@ async fn get_openvex(
     State(state): State<AppState>,
 ) -> AppResult<Json<serde_json::Value>> {
     let recipe = load_recipe(&state, id).await?;
-    let statements = state.store.list_vex(id).await?;
+    let builds = state.store.list_builds(id).await?;
+    let decision_scan = load_decision_scan(&state, id, latest_build_evidence(&builds)).await?;
+    let external = state.store.list_vex(id).await?;
+    let statements = combined_vex_statements(&recipe, decision_scan.as_ref(), &external);
     Ok(Json(openvex_document(&recipe, &statements)))
 }
 
@@ -1283,7 +2359,9 @@ async fn get_attestation(
 ) -> AppResult<Json<serde_json::Value>> {
     let recipe = load_recipe(&state, id).await?;
     let builds = state.store.list_builds(id).await?;
-    let vex = state.store.list_vex(id).await?;
+    let decision_scan = load_decision_scan(&state, id, latest_build_evidence(&builds)).await?;
+    let external = state.store.list_vex(id).await?;
+    let vex = combined_vex_statements(&recipe, decision_scan.as_ref(), &external);
     Ok(Json(attestation_document(
         &recipe,
         latest_build_evidence(&builds),
@@ -1297,14 +2375,12 @@ async fn get_slsa(
 ) -> AppResult<Json<serde_json::Value>> {
     let recipe = load_recipe(&state, id).await?;
     let builds = state.store.list_builds(id).await?;
-    let latest_scan = state.store.latest_scan(id).await?;
+    let decision_scan = load_decision_scan(&state, id, latest_build_evidence(&builds)).await?;
     let vex = state.store.list_vex(id).await?;
-    Ok(Json(slsa_provenance_document(
-        &recipe,
-        latest_build_evidence(&builds),
-        latest_scan.as_ref(),
-        &vex,
-    )?))
+    Ok(Json(
+        verified_slsa_provenance_document(&state, &recipe, &builds, decision_scan.as_ref(), &vex)
+            .await?,
+    ))
 }
 
 async fn oci_manifest_response(
@@ -1317,7 +2393,7 @@ async fn oci_manifest_response(
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.oci.artifact.manifest.v1+json"),
+            HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
         );
         headers.insert(
             header::CONTENT_LENGTH,
@@ -1425,25 +2501,43 @@ async fn oci_blob_response(
     state: AppState,
     include_body: bool,
 ) -> AppResult<Response> {
-    if let Some(recipe_id) = state.store.lookup_blob_recipe(&digest).await {
-        if let Some(recipe) = state.store.get_recipe(recipe_id).await? {
-            let config = oci_image_config_bytes(&recipe)?;
-            // Re-verify the digest to defend against index drift.
-            if recipe.name == name && crate::digest::digest_bytes(&config) == digest {
-                enforce_manifest_gate(&state, &recipe).await?;
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/vnd.oci.image.config.v1+json"),
-                );
-                headers.insert(header::CONTENT_LENGTH, HeaderValue::from(config.len()));
-                headers.insert("Docker-Content-Digest", header_value(&digest)?);
-                return if include_body {
-                    Ok((headers, config).into_response())
-                } else {
-                    Ok((StatusCode::OK, headers).into_response())
-                };
-            }
+    if digest == digest_bytes(OCI_EMPTY_CONFIG_BYTES) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(OCI_EMPTY_CONFIG_MEDIA_TYPE),
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from(OCI_EMPTY_CONFIG_BYTES.len()),
+        );
+        headers.insert("Docker-Content-Digest", header_value(&digest)?);
+        return if include_body {
+            Ok((headers, OCI_EMPTY_CONFIG_BYTES).into_response())
+        } else {
+            Ok((StatusCode::OK, headers).into_response())
+        };
+    }
+
+    if let Some(recipe_id) = state.store.lookup_blob_recipe(&digest).await
+        && let Some(recipe) = state.store.get_recipe(recipe_id).await?
+    {
+        let config = oci_image_config_bytes(&recipe)?;
+        // Re-verify the digest to defend against index drift.
+        if recipe.name == name && crate::digest::digest_bytes(&config) == digest {
+            enforce_manifest_gate(&state, &recipe).await?;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/vnd.oci.image.config.v1+json"),
+            );
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(config.len()));
+            headers.insert("Docker-Content-Digest", header_value(&digest)?);
+            return if include_body {
+                Ok((headers, config).into_response())
+            } else {
+                Ok((StatusCode::OK, headers).into_response())
+            };
         }
     }
 
@@ -1475,7 +2569,7 @@ async fn oci_blob_response(
                 let Some(path) = layer.path.as_ref() else {
                     return Err(AppError::not_found(format!("blob {digest} not found")));
                 };
-                let size = validate_layer_artifact_file(path, &layer.digest, layer.size)
+                let size = validate_cached_layer_metadata(&state, path, &layer.digest, layer.size)
                     .await
                     .map_err(|_| AppError::not_found(format!("blob {digest} not found")))?;
                 let mut headers = HeaderMap::new();
@@ -1496,19 +2590,30 @@ async fn oci_blob_response(
             }
         }
 
-        if let Some(document) = metadata_document_by_digest(&state, &recipe, &digest).await? {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, header_value(document.artifact_type)?);
-            headers.insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(document.bytes.len()),
-            );
-            headers.insert("Docker-Content-Digest", header_value(&document.digest)?);
-            return if include_body {
-                Ok((headers, document.bytes).into_response())
-            } else {
-                Ok((StatusCode::OK, headers).into_response())
-            };
+        match metadata_document_by_digest(&state, &recipe, &digest).await {
+            Ok(Some(document)) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, header_value(document.artifact_type)?);
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from(document.bytes.len()),
+                );
+                headers.insert("Docker-Content-Digest", header_value(&document.digest)?);
+                return if include_body {
+                    Ok((headers, document.bytes).into_response())
+                } else {
+                    Ok((StatusCode::OK, headers).into_response())
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    recipe_id = %recipe.id,
+                    %digest,
+                    "skipping unreadable recipe evidence during metadata blob discovery"
+                );
+            }
         }
     }
 
@@ -1532,14 +2637,6 @@ struct MetadataSubject {
 }
 
 impl MetadataSubject {
-    fn recipe(recipe: &Recipe) -> Self {
-        Self {
-            media_type: "application/vnd.fulcr.recipe.v1+json",
-            digest: recipe.digest.clone(),
-            size: 0,
-        }
-    }
-
     fn image(manifest: &MaterializedImageManifest) -> Self {
         Self {
             media_type: "application/vnd.oci.image.manifest.v1+json",
@@ -1555,9 +2652,11 @@ async fn metadata_documents(
     subject: &MetadataSubject,
 ) -> AppResult<Vec<MetadataDocument>> {
     let builds = state.store.list_builds(recipe.id).await?;
-    let latest_scan = state.store.latest_scan(recipe.id).await?;
-    let vex = state.store.list_vex(recipe.id).await?;
-    let sbom = latest_scan
+    let decision_scan =
+        load_decision_scan(state, recipe.id, latest_build_evidence(&builds)).await?;
+    let external_vex = state.store.list_vex(recipe.id).await?;
+    let vex = combined_vex_statements(recipe, decision_scan.as_ref(), &external_vex);
+    let sbom = decision_scan
         .as_ref()
         .map(|scan| scan.sbom.clone())
         .unwrap_or_else(|| sbom_document(recipe));
@@ -1566,10 +2665,18 @@ async fn metadata_documents(
     } else {
         "application/vnd.cyclonedx+json"
     };
-    let cbom = latest_scan
+    let cbom = decision_scan
         .as_ref()
         .map(|scan| scan.cbom.clone())
         .unwrap_or_else(|| cbom_document(recipe));
+    let slsa = verified_slsa_provenance_document(
+        state,
+        recipe,
+        &builds,
+        decision_scan.as_ref(),
+        &external_vex,
+    )
+    .await?;
 
     let values = [
         (
@@ -1594,12 +2701,7 @@ async fn metadata_documents(
             "slsa",
             "application/vnd.in-toto+json",
             format!("/v1/recipes/{}/slsa", recipe.id),
-            slsa_provenance_document(
-                recipe,
-                latest_build_evidence(&builds),
-                latest_scan.as_ref(),
-                &vex,
-            )?,
+            slsa,
         ),
         (
             "attestation",
@@ -1613,10 +2715,17 @@ async fn metadata_documents(
     for (title, artifact_type, endpoint, value) in values {
         let bytes = serde_json::to_vec(&value)?;
         let digest = digest_bytes(&bytes);
+        let empty_config_digest = digest_bytes(OCI_EMPTY_CONFIG_BYTES);
         let manifest = json!({
-            "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "artifactType": artifact_type,
-            "blobs": [{
+            "config": {
+                "mediaType": OCI_EMPTY_CONFIG_MEDIA_TYPE,
+                "digest": empty_config_digest,
+                "size": OCI_EMPTY_CONFIG_BYTES.len()
+            },
+            "layers": [{
                 "mediaType": artifact_type,
                 "digest": digest,
                 "size": bytes.len() as u64,
@@ -1654,8 +2763,13 @@ async fn metadata_document_by_digest(
     recipe: &Recipe,
     digest: &str,
 ) -> AppResult<Option<MetadataDocument>> {
+    let manifest = match materialized_image_manifest(state, recipe).await {
+        Ok(manifest) => manifest,
+        Err(AppError::Forbidden(_) | AppError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     Ok(
-        metadata_documents(state, recipe, &MetadataSubject::recipe(recipe))
+        metadata_documents(state, recipe, &MetadataSubject::image(&manifest))
             .await?
             .into_iter()
             .find(|document| document.digest == digest),
@@ -1671,17 +2785,24 @@ async fn metadata_artifact_manifest_by_digest(
         if recipe.name != name {
             continue;
         }
-        let mut subjects = vec![MetadataSubject::recipe(&recipe)];
         if let Ok(manifest) = materialized_image_manifest(state, &recipe).await {
-            subjects.push(MetadataSubject::image(&manifest));
-        }
-        for subject in subjects {
-            if let Some(document) = metadata_documents(state, &recipe, &subject)
-                .await?
-                .into_iter()
-                .find(|document| document.manifest_digest == digest)
-            {
-                return Ok(Some(document));
+            match metadata_documents(state, &recipe, &MetadataSubject::image(&manifest)).await {
+                Ok(documents) => {
+                    if let Some(document) = documents
+                        .into_iter()
+                        .find(|document| document.manifest_digest == digest)
+                    {
+                        return Ok(Some(document));
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        recipe_id = %recipe.id,
+                        %digest,
+                        "skipping unreadable recipe evidence during metadata manifest discovery"
+                    );
+                }
             }
         }
     }
@@ -1727,13 +2848,32 @@ async fn latest_materialized_layer(state: &AppState, recipe: &Recipe) -> AppResu
             build.id
         )));
     }
+    if let Some(expires_at) = artifact.expires_at.as_deref() {
+        match artifact_is_expired(expires_at) {
+            Ok(true) => {
+                return Err(AppError::forbidden(format!(
+                    "metadata gate allowed pull, but latest build {} artifact expired at {expires_at}",
+                    build.id
+                )));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(AppError::forbidden(format!(
+                    "metadata gate allowed pull, but latest build {} has invalid artifact expiry metadata: {error}",
+                    build.id
+                )));
+            }
+        }
+    }
     let Some(path) = artifact.path.as_ref() else {
         return Err(AppError::forbidden(format!(
             "metadata gate allowed pull, but latest build {} artifact has no cache path",
             build.id
         )));
     };
-    if let Err(error) = validate_layer_artifact_file(path, &artifact.digest, artifact.size).await {
+    if let Err(error) =
+        validate_existing_cached_layer(state, path, &artifact.digest, artifact.size).await
+    {
         return Err(AppError::forbidden(format!(
             "metadata gate allowed pull, but cached artifact for build {} is invalid: {error}",
             build.id
@@ -1742,23 +2882,19 @@ async fn latest_materialized_layer(state: &AppState, recipe: &Recipe) -> AppResu
     Ok(artifact)
 }
 
+fn artifact_is_expired(expires_at: &str) -> anyhow::Result<bool> {
+    let expires_at =
+        time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339)
+            .context("parsing artifact expiry timestamp")?;
+    Ok(expires_at <= time::OffsetDateTime::now_utc())
+}
+
 async fn load_recipe(state: &AppState, id: Uuid) -> AppResult<Recipe> {
     state
         .store
         .get_recipe(id)
         .await?
         .ok_or_else(|| AppError::not_found(format!("recipe {id} not found")))
-}
-
-async fn enforce_build_gate(state: &AppState, recipe: &Recipe) -> AppResult<()> {
-    let decision = metadata_gate(state, recipe).await?;
-    if decision.outcome == GateOutcome::Denied {
-        return Err(AppError::forbidden(format!(
-            "metadata gate denied build: {}",
-            decision.reasons.join("; ")
-        )));
-    }
-    Ok(())
 }
 
 async fn enforce_manifest_gate(state: &AppState, recipe: &Recipe) -> AppResult<()> {
@@ -1774,14 +2910,129 @@ async fn enforce_manifest_gate(state: &AppState, recipe: &Recipe) -> AppResult<(
 
 async fn metadata_gate(state: &AppState, recipe: &Recipe) -> AppResult<GateDecision> {
     let builds = state.store.list_builds(recipe.id).await?;
-    let latest_scan = state.store.latest_scan(recipe.id).await?;
     let vex = state.store.list_vex(recipe.id).await?;
-    Ok(gate::evaluate_gate(
-        recipe,
-        latest_build_evidence(&builds),
-        latest_scan.as_ref(),
-        &vex,
-    ))
+    let latest_build = latest_build_evidence(&builds);
+    let decision_scan = load_decision_scan(state, recipe.id, latest_build).await?;
+    let mut decision = gate::evaluate_gate(recipe, latest_build, decision_scan.as_ref(), &vex);
+    if let Some(build) = latest_build
+        && let Some(reason) = source_scan_binding_error(state, recipe, build).await
+    {
+        decision.reasons.push(reason);
+        decision.outcome = GateOutcome::Denied;
+    }
+    Ok(decision)
+}
+
+async fn load_decision_scan(
+    state: &AppState,
+    recipe_id: Uuid,
+    latest_build: Option<&BuildRecord>,
+) -> AppResult<Option<ScanReport>> {
+    if let Some(scan_id) = latest_build.and_then(|build| build.artifact_scan_id) {
+        return state
+            .store
+            .get_scan(recipe_id, scan_id)
+            .await?
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::forbidden(format!(
+                    "artifact assessment scan binding {scan_id} is missing"
+                ))
+            });
+    }
+    state.store.latest_scan(recipe_id).await.map_err(Into::into)
+}
+
+async fn source_scan_binding_error(
+    state: &AppState,
+    recipe: &Recipe,
+    build: &BuildRecord,
+) -> Option<String> {
+    let (Some(source_scan_id), Some(expected_digest)) =
+        (build.source_scan_id, build.source_scan_digest.as_deref())
+    else {
+        return None;
+    };
+    match state.store.get_scan(recipe.id, source_scan_id).await {
+        Ok(Some(scan)) => {
+            if scan.recipe_id != recipe.id
+                || scan.recipe_digest != recipe.digest
+                || !matches!(scan.mode, crate::models::ScanMode::Source)
+                || !scan
+                    .filesystem_digest
+                    .as_deref()
+                    .is_some_and(valid_sha256_digest)
+            {
+                return Some(format!(
+                    "source scan binding {} has the wrong recipe identity or mode",
+                    source_scan_id
+                ));
+            }
+            match scan_evidence_digest(&scan) {
+                Ok(actual_digest) if actual_digest == expected_digest => None,
+                Ok(actual_digest) => Some(format!(
+                    "source scan binding {} digest mismatch: expected {}, found {}",
+                    source_scan_id, expected_digest, actual_digest
+                )),
+                Err(error) => Some(format!(
+                    "source scan binding {} could not be digested: {}",
+                    source_scan_id, error
+                )),
+            }
+        }
+        Ok(None) => Some(format!("source scan binding {} is missing", source_scan_id)),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                %source_scan_id,
+                recipe_id = %recipe.id,
+                "failed to load source scan binding"
+            );
+            Some(format!(
+                "source scan binding {} is unreadable",
+                source_scan_id
+            ))
+        }
+    }
+}
+
+fn valid_sha256_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|value| {
+        value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+    })
+}
+
+async fn verified_slsa_provenance_document(
+    state: &AppState,
+    recipe: &Recipe,
+    builds: &[BuildRecord],
+    latest_scan: Option<&ScanReport>,
+    external_vex: &[VexStatement],
+) -> AppResult<serde_json::Value> {
+    let latest_build = latest_build_evidence(builds);
+    let vex = combined_vex_statements(recipe, latest_scan, external_vex);
+    let mut document = slsa_provenance_document(recipe, latest_build, latest_scan, &vex)?;
+    if let Some(build) = latest_build
+        && let Some(reason) = source_scan_binding_error(state, recipe, build).await
+    {
+        if let Some(outcome) =
+            document.pointer_mut("/predicate/runDetails/metadata/fulcrSlsaPolicy/outcome")
+        {
+            *outcome = json!("denied");
+        }
+        if let Some(findings) = document
+            .pointer_mut("/predicate/runDetails/metadata/fulcrSlsaPolicy/findings")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            findings.push(json!({
+                "severity": "high",
+                "category": "slsa-invalid-source-scan-binding",
+                "message": reason,
+                "evidence": format!("build.{}", build.id)
+            }));
+        }
+    }
+    Ok(document)
 }
 
 fn latest_build_evidence(builds: &[BuildRecord]) -> Option<&BuildRecord> {
@@ -1791,224 +3042,24 @@ fn latest_build_evidence(builds: &[BuildRecord]) -> Option<&BuildRecord> {
         .find(|build| !matches!(build.status, BuildStatus::Planned))
 }
 
-async fn execute_native(
-    cmd: Vec<String>,
-    env: Vec<String>,
-    working_dir: &str,
-    network_disabled: bool,
-    monitor_security: bool,
-) -> anyhow::Result<(i64, Vec<u8>, Vec<u8>, Vec<String>)> {
-    if cmd.is_empty() {
-        return Err(anyhow::anyhow!("empty command"));
-    }
-
-    if network_disabled {
-        return Err(anyhow::anyhow!(
-            "network-disabled execution requires an enforced native sandbox"
-        ));
-    }
-
-    let mut command = tokio::process::Command::new(&cmd[0]);
-    command.args(&cmd[1..]);
-    command.current_dir(working_dir);
-
-    // Provide env vars
-    command.env_clear();
-    for e in env {
-        if let Some((k, v)) = e.split_once('=') {
-            command.env(k, v);
-        }
-    }
-
-    // Capture output
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn: {}", e))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to capture stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to capture stderr"))?;
-    let stdout_task = tokio::spawn(read_capped(stdout, BUILD_OUTPUT_LIMIT_BYTES));
-    let stderr_task = tokio::spawn(read_capped(stderr, BUILD_OUTPUT_LIMIT_BYTES));
-
-    let status = match tokio::time::timeout(
-        std::time::Duration::from_secs(BUILD_TIMEOUT_SECONDS),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("failed to wait: {}", e))?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return Err(anyhow::anyhow!(
-                "command timed out after {BUILD_TIMEOUT_SECONDS} seconds"
-            ));
-        }
-    };
-
-    let exit_code = status.code().unwrap_or(1) as i64;
-    let (stdout_buf, stdout_truncated) = stdout_task
-        .await
-        .map_err(|e| anyhow::anyhow!("stdout reader failed: {}", e))?
-        .map_err(|e| anyhow::anyhow!("stdout read failed: {}", e))?;
-    let (mut stderr_buf, stderr_truncated) = stderr_task
-        .await
-        .map_err(|e| anyhow::anyhow!("stderr reader failed: {}", e))?
-        .map_err(|e| anyhow::anyhow!("stderr read failed: {}", e))?;
-    if stdout_truncated {
-        stderr_buf.extend_from_slice(b"\n[fulcr] stdout exceeded output capture limit\n");
-    }
-    if stderr_truncated {
-        stderr_buf.extend_from_slice(b"\n[fulcr] stderr exceeded output capture limit\n");
-    }
-    let mut anomalies = Vec::new();
-
-    // Security monitoring on output
-    if monitor_security {
-        let out_str = String::from_utf8_lossy(&stdout_buf);
-        let err_str = String::from_utf8_lossy(&stderr_buf);
-        for s in out_str.lines().chain(err_str.lines()) {
-            if s.contains("curl ")
-                || s.contains("wget ")
-                || s.contains("chmod ")
-                || s.contains("nc ")
-            {
-                let warn = format!(
-                    "[SECURITY WARN] Suspicious runtime activity detected: {}",
-                    s
-                );
-                println!("{}", warn);
-                anomalies.push(s.trim().to_string());
-            }
-        }
-    }
-
-    Ok((exit_code, stdout_buf, stderr_buf, anomalies))
-}
-
-async fn read_capped<R: AsyncRead + Unpin>(
-    mut reader: R,
-    cap: usize,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut output = Vec::new();
-    let mut truncated = false;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        let remaining = cap.saturating_sub(output.len());
-        if remaining > 0 {
-            output.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-        if read > remaining {
-            truncated = true;
-        }
-    }
-    Ok((output, truncated))
-}
-
 async fn execute_build(
     state: &AppState,
     recipe: &Recipe,
     request: BuildRequest,
 ) -> AppResult<BuildRecord> {
-    if recipe.build.command.is_empty() {
-        return Err(AppError::bad_request("recipe build command is empty"));
-    }
-    if recipe.build.run_command.is_some() {
-        return Err(AppError::bad_request(
-            "build.run_command requires an enforced native sandbox and is not supported yet",
-        ));
-    }
-
     let started_at = timestamp();
     let working_dir = resolve_working_dir(recipe, &state.work_dir)?;
-    let mut notes = Vec::new();
-
-    let env: Vec<String> = request
-        .environment
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
-
-    // 1. Build Phase (network allowed)
-    let (build_exit, mut stdout_buf, mut stderr_buf, mut all_anomalies) = execute_native(
-        recipe.build.command.clone(),
-        env.clone(),
-        &working_dir.to_string_lossy(),
-        false, // network_disabled = false
-        false, // monitor_security = false
-    )
-    .await
-    .unwrap_or_else(|error| {
-        notes.push(format!("build command failed before completion: {error}"));
-        (
-            1,
-            Vec::new(),
-            format!("build command failed before completion: {error}\n").into_bytes(),
-            Vec::new(),
-        )
-    });
-
-    let mut exit_code = Some(build_exit);
-
-    // 2. Run / Scan Phase. Fail closed unless network isolation is actually enforced.
-    if build_exit == 0 {
-        if let Some(run_cmd) = &recipe.build.run_command {
-            stdout_buf.extend_from_slice(
-                b"
---- RUN PHASE ---
-",
-            );
-            stderr_buf.extend_from_slice(
-                b"
---- RUN PHASE ---
-",
-            );
-
-            match execute_native(
-                run_cmd.clone(),
-                env,
-                &working_dir.to_string_lossy(),
-                true, // network_disabled = true
-                true, // monitor_security = true
-            )
-            .await
-            {
-                Ok((run_exit, run_stdout, run_stderr, run_anomalies)) => {
-                    exit_code = Some(run_exit);
-                    stdout_buf.extend_from_slice(&run_stdout);
-                    stderr_buf.extend_from_slice(&run_stderr);
-                    all_anomalies.extend(run_anomalies);
-                }
-                Err(error) => {
-                    exit_code = Some(1);
-                    notes.push(format!("run command refused: {error}"));
-                    stderr_buf
-                        .extend_from_slice(format!("run command refused: {error}\n").as_bytes());
-                }
-            }
-        }
+    let mut notes = vec![
+        "fulcr did not execute recipe commands; this record imports a prebuilt OCI layer artifact"
+            .to_string(),
+    ];
+    if !request.environment.is_empty() {
+        notes.push(
+            "build request environment was ignored because native execution is disabled"
+                .to_string(),
+        );
     }
-
-    let mut status = if exit_code.unwrap_or(1) == 0 {
-        BuildStatus::Succeeded
-    } else {
-        BuildStatus::Failed
-    };
+    let mut status = BuildStatus::Succeeded;
 
     let artifact = read_artifact_ref(
         state,
@@ -2019,22 +3070,28 @@ async fn execute_build(
         &mut notes,
     )
     .await?;
+    if artifact.is_none() {
+        status = BuildStatus::Failed;
+    }
 
     let record = BuildRecord {
         id: Uuid::new_v4(),
         recipe_id: recipe.id,
         recipe_digest: recipe.digest.clone(),
+        source_scan_id: None,
+        source_scan_digest: None,
+        artifact_scan_id: None,
+        policy_decision: None,
         status,
         created_at: started_at.clone(),
         started_at: Some(started_at),
         finished_at: Some(timestamp()),
-        command: recipe.build.command.clone(),
+        command: Vec::new(),
         working_dir: Some(working_dir),
-        exit_code: exit_code.map(|c| c as i32),
+        exit_code: None,
         artifact,
-        stdout_tail: Some(tail_lossy(&stdout_buf, 4096)),
-        stderr_tail: Some(tail_lossy(&stderr_buf, 4096)),
-        security_anomalies: all_anomalies,
+        stdout_tail: None,
+        stderr_tail: None,
         notes,
     };
 
@@ -2094,9 +3151,24 @@ async fn read_artifact_ref(
         return Ok(None);
     }
 
-    let size = match layer_artifact_size(&canonical).await {
+    let retained = request.cache_artifact || recipe.policy.retain_artifact;
+    let (validated_path, temporary_path) = if retained {
+        let temporary_path = state
+            .store
+            .cache_dir()
+            .join(format!(".ingest-{}", Uuid::new_v4()));
+        fs::copy(&canonical, &temporary_path).await?;
+        (temporary_path.clone(), Some(temporary_path))
+    } else {
+        (canonical.clone(), None)
+    };
+
+    let size = match layer_artifact_size(&validated_path).await {
         Ok(size) => size,
         Err(error) => {
+            if let Some(path) = temporary_path.as_ref() {
+                let _ = fs::remove_file(path).await;
+            }
             *status = BuildStatus::Failed;
             notes.push(format!(
                 "declared artifact is too large or unreadable: {error}"
@@ -2104,7 +3176,10 @@ async fn read_artifact_ref(
             return Ok(None);
         }
     };
-    if let Err(error) = validate_oci_layer_tar_file(&canonical, size).await {
+    if let Err(error) = validate_oci_layer_tar_file(&validated_path, size).await {
+        if let Some(path) = temporary_path.as_ref() {
+            let _ = fs::remove_file(path).await;
+        }
         *status = BuildStatus::Failed;
         notes.push(format!(
             "declared artifact is not a valid uncompressed OCI layer tar: {error}"
@@ -2112,11 +3187,23 @@ async fn read_artifact_ref(
         return Ok(None);
     }
 
-    let digest = digest_file(&canonical).await?;
-    let retained = request.cache_artifact || recipe.policy.retain_artifact;
-    let (path, expires_at) = if retained {
+    let digest = digest_file(&validated_path).await?;
+    let (path, expires_at) = if let Some(temporary_path) = temporary_path {
         let cache_path = state.store.cache_dir().join(cache_file_name(&digest));
-        fs::copy(&canonical, &cache_path).await?;
+        set_cache_file_read_only(&temporary_path).await?;
+        match fs::hard_link(&temporary_path, &cache_path).await {
+            Ok(()) => {
+                fs::remove_file(&temporary_path).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&temporary_path).await?;
+                validate_existing_cached_layer(state, &cache_path, &digest, size).await?;
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path).await;
+                return Err(error.into());
+            }
+        }
         let expires_at = if recipe.policy.cache_ttl_seconds == 0 {
             None
         } else {
@@ -2158,21 +3245,60 @@ fn validated_layer_diff_id(artifact: &ArtifactRef) -> AppResult<String> {
     }
 }
 
-async fn validate_layer_artifact_file(
+async fn validate_cached_layer_metadata(
+    state: &AppState,
     path: &FsPath,
     expected_digest: &str,
     expected_size: u64,
 ) -> anyhow::Result<u64> {
-    let size = layer_artifact_size(path).await?;
-    if size != expected_size {
-        anyhow::bail!("layer artifact size changed: expected {expected_size}, found {size}");
+    let expected_path = state
+        .store
+        .cache_dir()
+        .join(cache_file_name(expected_digest));
+    if path != expected_path {
+        anyhow::bail!(
+            "layer cache path does not match content digest: expected {}, found {}",
+            expected_path.display(),
+            path.display()
+        );
     }
-    let digest = digest_file(path).await?;
-    if digest != expected_digest {
-        anyhow::bail!("layer artifact digest changed: expected {expected_digest}, found {digest}");
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("reading cache metadata for {}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!("layer cache path is not a regular file");
     }
-    validate_oci_layer_tar_file(path, size).await?;
-    Ok(size)
+    if metadata.len() != expected_size {
+        anyhow::bail!(
+            "layer artifact size changed: expected {expected_size}, found {}",
+            metadata.len()
+        );
+    }
+    Ok(metadata.len())
+}
+
+async fn validate_existing_cached_layer(
+    state: &AppState,
+    path: &FsPath,
+    expected_digest: &str,
+    expected_size: u64,
+) -> anyhow::Result<()> {
+    validate_cached_layer_metadata(state, path, expected_digest, expected_size).await?;
+    let actual_digest = digest_file(path).await?;
+    if actual_digest != expected_digest {
+        anyhow::bail!(
+            "existing cache blob digest mismatch: expected {expected_digest}, found {actual_digest}"
+        );
+    }
+    validate_oci_layer_tar_file(path, expected_size).await?;
+    Ok(())
+}
+
+async fn set_cache_file_read_only(path: &FsPath) -> anyhow::Result<()> {
+    let mut permissions = fs::metadata(path).await?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).await?;
+    Ok(())
 }
 
 fn file_body(file: fs::File) -> Body {
@@ -2316,16 +3442,6 @@ fn anchor_under(path: &FsPath, base: &FsPath) -> PathBuf {
     }
 }
 
-fn tail_lossy(bytes: &[u8], max: usize) -> String {
-    let lossy = String::from_utf8_lossy(bytes);
-    if lossy.len() <= max {
-        lossy.into_owned()
-    } else {
-        let start = lossy.floor_char_boundary(lossy.len() - max);
-        lossy[start..].to_string()
-    }
-}
-
 type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug)]
@@ -2333,6 +3449,11 @@ enum AppError {
     BadRequest(String),
     Forbidden(String),
     NotFound(String),
+    Oci {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
     Internal(anyhow::Error),
 }
 
@@ -2348,6 +3469,35 @@ impl AppError {
     fn not_found(message: impl Into<String>) -> Self {
         Self::NotFound(message.into())
     }
+
+    fn into_oci(self, not_found_code: &'static str) -> Self {
+        match self {
+            Self::BadRequest(message) => Self::Oci {
+                status: StatusCode::BAD_REQUEST,
+                code: "NAME_INVALID",
+                message,
+            },
+            Self::Forbidden(message) => Self::Oci {
+                status: StatusCode::FORBIDDEN,
+                code: "DENIED",
+                message,
+            },
+            Self::NotFound(message) => Self::Oci {
+                status: StatusCode::NOT_FOUND,
+                code: not_found_code,
+                message,
+            },
+            Self::Internal(error) => {
+                tracing::error!(?error, "internal OCI error");
+                Self::Oci {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "UNKNOWN",
+                    message: "internal server error".to_string(),
+                }
+            }
+            error @ Self::Oci { .. } => error,
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -2356,6 +3506,17 @@ impl IntoResponse for AppError {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
+            Self::Oci {
+                status,
+                code,
+                message,
+            } => {
+                return (
+                    status,
+                    Json(json!({ "errors": [{ "code": code, "message": message }] })),
+                )
+                    .into_response();
+            }
             Self::Internal(error) => {
                 tracing::error!(?error, "internal error");
                 (

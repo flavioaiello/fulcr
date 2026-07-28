@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::digest::digest_json;
@@ -130,8 +130,6 @@ pub struct BuildSpec {
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
-    pub run_command: Option<Vec<String>>,
-    #[serde(default)]
     pub working_dir: Option<PathBuf>,
     #[serde(default)]
     pub artifact: Option<PathBuf>,
@@ -161,6 +159,10 @@ pub struct CryptoMaterial {
 pub struct RetentionPolicy {
     #[serde(default = "default_true")]
     pub durable_metadata_only: bool,
+    #[serde(default = "default_true")]
+    pub require_osv: bool,
+    #[serde(default)]
+    pub allow_external_vex_overrides: bool,
     #[serde(default)]
     pub retain_artifact: bool,
     #[serde(default = "default_cache_ttl_seconds")]
@@ -171,6 +173,8 @@ impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
             durable_metadata_only: true,
+            require_osv: true,
+            allow_external_vex_overrides: false,
             retain_artifact: false,
             cache_ttl_seconds: default_cache_ttl_seconds(),
         }
@@ -185,6 +189,8 @@ pub struct BuildRequest {
     pub cache_artifact: bool,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub osv_mode: OsvMode,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -195,6 +201,17 @@ pub struct ScanRequest {
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub max_file_bytes: Option<u64>,
+    #[serde(default)]
+    pub osv_mode: OsvMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OsvMode {
+    #[default]
+    Required,
+    BestEffort,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +232,10 @@ pub struct ScanReport {
     pub created_at: String,
     pub scanner: String,
     #[serde(default)]
+    pub filesystem_digest: Option<String>,
+    #[serde(default)]
+    pub declared_artifact_digest: Option<String>,
+    #[serde(default)]
     pub mode: ScanMode,
     pub root: PathBuf,
     #[serde(default)]
@@ -226,7 +247,8 @@ pub struct ScanReport {
     #[serde(default)]
     pub binaries: Vec<BinaryAnalysis>,
     pub findings: Vec<ScanFinding>,
-    pub vex_candidates: Vec<VexCandidate>,
+    #[serde(alias = "vex_candidates")]
+    pub vulnerability_assessments: Vec<VulnerabilityAssessment>,
     pub sbom: serde_json::Value,
     pub cbom: serde_json::Value,
 }
@@ -249,6 +271,8 @@ pub struct ImageScanMetadata {
 pub struct ImageLayerMetadata {
     pub digest: String,
     #[serde(default)]
+    pub diff_id: Option<String>,
+    #[serde(default)]
     pub media_type: Option<String>,
     pub size: u64,
 }
@@ -269,7 +293,8 @@ pub struct ScanSummary {
     #[serde(default)]
     pub binaries_analyzed: usize,
     pub findings_detected: usize,
-    pub vex_candidates_detected: usize,
+    #[serde(alias = "vex_candidates_detected")]
+    pub vulnerability_assessments_detected: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,7 +360,7 @@ pub enum FindingSeverity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VexCandidate {
+pub struct VulnerabilityAssessment {
     pub vulnerability: String,
     pub status: VexStatus,
     pub component: String,
@@ -374,6 +399,14 @@ pub struct BuildRecord {
     pub id: Uuid,
     pub recipe_id: Uuid,
     pub recipe_digest: String,
+    #[serde(default)]
+    pub source_scan_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_scan_digest: Option<String>,
+    #[serde(default)]
+    pub artifact_scan_id: Option<Uuid>,
+    #[serde(default)]
+    pub policy_decision: Option<GateDecision>,
     pub status: BuildStatus,
     pub created_at: String,
     #[serde(default)]
@@ -393,8 +426,6 @@ pub struct BuildRecord {
     #[serde(default)]
     pub stderr_tail: Option<String>,
     #[serde(default)]
-    pub security_anomalies: Vec<String>,
-    #[serde(default)]
     pub notes: Vec<String>,
 }
 
@@ -404,6 +435,10 @@ impl BuildRecord {
             id: Uuid::new_v4(),
             recipe_id: recipe.id,
             recipe_digest: recipe.digest.clone(),
+            source_scan_id: None,
+            source_scan_digest: None,
+            artifact_scan_id: None,
+            policy_decision: None,
             status: BuildStatus::Planned,
             created_at: timestamp(),
             started_at: None,
@@ -414,7 +449,6 @@ impl BuildRecord {
             artifact: None,
             stdout_tail: None,
             stderr_tail: None,
-            security_anomalies: Vec::new(),
             notes: vec![
                 "metadata-only plan; execute a retained build to make an OCI layer pullable"
                     .to_string(),
@@ -464,6 +498,8 @@ pub struct VexInput {
     pub detail: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +520,8 @@ pub struct VexStatement {
     pub detail: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 impl VexStatement {
@@ -500,11 +538,12 @@ impl VexStatement {
             justification: input.justification,
             detail: input.detail,
             author: input.author,
+            expires_at: input.expires_at,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VexStatus {
     NotAffected,
@@ -565,6 +604,68 @@ mod tests {
             "false"
         );
         assert_eq!(metadata_only["history"][0]["empty_layer"], true);
+    }
+
+    #[test]
+    fn autonomous_security_defaults_require_osv_and_disable_external_overrides() {
+        let scan_request: ScanRequest = serde_json::from_str("{}").unwrap();
+        let build_request: BuildRequest = serde_json::from_str("{}").unwrap();
+        let policy = RetentionPolicy::default();
+
+        assert!(matches!(scan_request.osv_mode, OsvMode::Required));
+        assert!(matches!(build_request.osv_mode, OsvMode::Required));
+        assert!(policy.require_osv);
+        assert!(!policy.allow_external_vex_overrides);
+    }
+
+    #[test]
+    fn scan_report_accepts_legacy_vex_candidate_field_names() {
+        let recipe = Recipe::new(recipe_input_with_path("/tmp/checkout")).unwrap();
+        let report = ScanReport {
+            id: Uuid::new_v4(),
+            recipe_id: recipe.id,
+            recipe_digest: recipe.digest,
+            created_at: timestamp(),
+            scanner: "test".to_string(),
+            filesystem_digest: None,
+            declared_artifact_digest: None,
+            mode: ScanMode::Source,
+            root: PathBuf::from("."),
+            image: None,
+            status: ScanStatus::CompletedWithFindings,
+            summary: ScanSummary {
+                vulnerability_assessments_detected: 1,
+                ..Default::default()
+            },
+            components: Vec::new(),
+            crypto: Vec::new(),
+            binaries: Vec::new(),
+            findings: Vec::new(),
+            vulnerability_assessments: vec![VulnerabilityAssessment {
+                vulnerability: "CVE-2026-0001".to_string(),
+                status: VexStatus::UnderInvestigation,
+                component: "openssl".to_string(),
+                justification: "legacy".to_string(),
+                detail: "legacy record".to_string(),
+                evidence: "Cargo.lock".to_string(),
+            }],
+            sbom: serde_json::json!({}),
+            cbom: serde_json::json!({}),
+        };
+        let mut value = serde_json::to_value(report).unwrap();
+        let object = value.as_object_mut().unwrap();
+        let assessments = object.remove("vulnerability_assessments").unwrap();
+        object.insert("vex_candidates".to_string(), assessments);
+        let summary = object.get_mut("summary").unwrap().as_object_mut().unwrap();
+        let count = summary
+            .remove("vulnerability_assessments_detected")
+            .unwrap();
+        summary.insert("vex_candidates_detected".to_string(), count);
+
+        let parsed: ScanReport = serde_json::from_value(value).unwrap();
+
+        assert_eq!(parsed.vulnerability_assessments.len(), 1);
+        assert_eq!(parsed.summary.vulnerability_assessments_detected, 1);
     }
 
     fn recipe_input_with_path(path: &str) -> RecipeInput {

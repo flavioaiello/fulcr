@@ -2,7 +2,9 @@ use std::{collections::BTreeSet, fs};
 
 use fulcr::{
     gate,
-    models::{BuilderKind, BuilderRef, GateOutcome, Recipe, RecipeInput, ScanRequest, SourceRef},
+    models::{
+        BuilderKind, BuilderRef, GateOutcome, OsvMode, Recipe, RecipeInput, ScanRequest, SourceRef,
+    },
     scanner,
 };
 
@@ -58,7 +60,7 @@ async fn contains_visible_npm_worm_install_script_from_lockfile() {
     let recipe = tight_recipe(fs::canonicalize(temp.path()).unwrap().as_path());
     let report = scanner::scan_recipe(
         &recipe,
-        ScanRequest::default(),
+        offline_scan_request(),
         fs::canonicalize(temp.path()).unwrap().as_path(),
     )
     .await
@@ -66,17 +68,21 @@ async fn contains_visible_npm_worm_install_script_from_lockfile() {
     let categories = finding_categories(&report);
 
     assert!(categories.contains("sbom-lifecycle-script"));
-    assert!(report
-        .vex_candidates
-        .iter()
-        .any(|candidate| candidate.vulnerability == "fulcr-SBOM-LIFECYCLE-SCRIPT"));
+    assert!(
+        report
+            .vulnerability_assessments
+            .iter()
+            .any(|candidate| candidate.vulnerability == "fulcr-SBOM-LIFECYCLE-SCRIPT")
+    );
 
     let decision = gate::evaluate_gate(&recipe, None, Some(&report), &[]);
     assert_eq!(decision.outcome, GateOutcome::Denied);
-    assert!(decision
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("sbom-lifecycle-script")));
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("sbom-lifecycle-script"))
+    );
 }
 
 #[tokio::test]
@@ -112,7 +118,7 @@ async fn contains_token_harvesting_and_self_publish_script_metadata() {
     let recipe = tight_recipe(fs::canonicalize(temp.path()).unwrap().as_path());
     let report = scanner::scan_recipe(
         &recipe,
-        ScanRequest::default(),
+        offline_scan_request(),
         fs::canonicalize(temp.path()).unwrap().as_path(),
     )
     .await
@@ -124,10 +130,12 @@ async fn contains_token_harvesting_and_self_publish_script_metadata() {
 
     let decision = gate::evaluate_gate(&recipe, None, Some(&report), &[]);
     assert_eq!(decision.outcome, GateOutcome::Denied);
-    assert!(decision
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("sbom-suspicious-package-script")));
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("sbom-suspicious-package-script"))
+    );
 }
 
 #[tokio::test]
@@ -169,7 +177,7 @@ async fn blocks_historical_replay_when_provenance_is_weak() {
 
     let report = scanner::scan_recipe(
         &recipe,
-        ScanRequest::default(),
+        offline_scan_request(),
         fs::canonicalize(temp.path()).unwrap().as_path(),
     )
     .await
@@ -177,14 +185,18 @@ async fn blocks_historical_replay_when_provenance_is_weak() {
     let decision = gate::evaluate_gate(&recipe, None, Some(&report), &[]);
 
     assert_eq!(decision.outcome, GateOutcome::Denied);
-    assert!(decision
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("slsa-unpinned-source")));
-    assert!(decision
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("slsa-unpinned-builder")));
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("slsa-unpinned-source"))
+    );
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("slsa-unpinned-builder"))
+    );
 }
 
 fn tight_recipe(source_path: &std::path::Path) -> Recipe {
@@ -215,4 +227,11 @@ fn finding_categories(report: &fulcr::models::ScanReport) -> BTreeSet<&str> {
         .iter()
         .map(|finding| finding.category.as_str())
         .collect()
+}
+
+fn offline_scan_request() -> ScanRequest {
+    ScanRequest {
+        osv_mode: OsvMode::Disabled,
+        ..Default::default()
+    }
 }
